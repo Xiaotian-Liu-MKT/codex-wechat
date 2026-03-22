@@ -50,6 +50,14 @@ class SessionStore {
     return Object.keys(getThreadMap(binding)).sort((left, right) => left.localeCompare(right));
   }
 
+  hasPendingNewThreadForWorkspace(bindingKey, workspaceRoot) {
+    const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
+    if (!normalizedWorkspaceRoot) {
+      return false;
+    }
+    return !!this.state.bindings[bindingKey]?.pendingNewThreadByWorkspaceRoot?.[normalizedWorkspaceRoot];
+  }
+
   getActiveWorkspaceRoot(bindingKey) {
     return this.state.bindings[bindingKey]?.activeWorkspaceRoot || "";
   }
@@ -88,11 +96,16 @@ class SessionStore {
       ...getThreadMap(current),
       [normalizedWorkspaceRoot]: normalizeValue(threadId),
     };
+    const pendingNewThreadByWorkspaceRoot = {
+      ...getPendingNewThreadMap(current),
+      [normalizedWorkspaceRoot]: false,
+    };
 
     return this.updateBinding(bindingKey, {
       ...current,
       ...extra,
       activeWorkspaceRoot: normalizedWorkspaceRoot,
+      pendingNewThreadByWorkspaceRoot,
       threadIdByWorkspaceRoot,
     });
   }
@@ -111,6 +124,32 @@ class SessionStore {
 
     return this.updateBinding(bindingKey, {
       ...current,
+      threadIdByWorkspaceRoot,
+    });
+  }
+
+  setPendingNewThreadForWorkspace(bindingKey, workspaceRoot, enabled) {
+    const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
+    if (!normalizedWorkspaceRoot) {
+      return this.getBinding(bindingKey);
+    }
+
+    const current = this.getBinding(bindingKey) || {};
+    const pendingNewThreadByWorkspaceRoot = {
+      ...getPendingNewThreadMap(current),
+      [normalizedWorkspaceRoot]: !!enabled,
+    };
+    const threadIdByWorkspaceRoot = {
+      ...getThreadMap(current),
+    };
+    if (!(normalizedWorkspaceRoot in threadIdByWorkspaceRoot)) {
+      threadIdByWorkspaceRoot[normalizedWorkspaceRoot] = "";
+    }
+
+    return this.updateBinding(bindingKey, {
+      ...current,
+      activeWorkspaceRoot: normalizedWorkspaceRoot,
+      pendingNewThreadByWorkspaceRoot,
       threadIdByWorkspaceRoot,
     });
   }
@@ -196,6 +235,7 @@ class SessionStore {
     const current = this.getBinding(bindingKey) || {};
     const threadIdByWorkspaceRoot = getThreadMap(current);
     const codexParamsByWorkspaceRoot = getCodexParamsMap(current);
+    const pendingNewThreadByWorkspaceRoot = getPendingNewThreadMap(current);
     const hasWorkspaceEntry = Object.prototype.hasOwnProperty.call(
       threadIdByWorkspaceRoot,
       normalizedWorkspaceRoot
@@ -207,6 +247,7 @@ class SessionStore {
 
     delete threadIdByWorkspaceRoot[normalizedWorkspaceRoot];
     delete codexParamsByWorkspaceRoot[normalizedWorkspaceRoot];
+    delete pendingNewThreadByWorkspaceRoot[normalizedWorkspaceRoot];
 
     const nextActiveWorkspaceRoot = activeWorkspaceRoot === normalizedWorkspaceRoot
       ? (Object.keys(threadIdByWorkspaceRoot).sort((left, right) => left.localeCompare(right))[0] || "")
@@ -216,6 +257,7 @@ class SessionStore {
       ...current,
       activeWorkspaceRoot: nextActiveWorkspaceRoot,
       codexParamsByWorkspaceRoot,
+      pendingNewThreadByWorkspaceRoot,
       threadIdByWorkspaceRoot,
     });
   }
@@ -281,6 +323,10 @@ function getThreadMap(binding) {
 
 function getCodexParamsMap(binding) {
   return { ...(binding?.codexParamsByWorkspaceRoot || {}) };
+}
+
+function getPendingNewThreadMap(binding) {
+  return { ...(binding?.pendingNewThreadByWorkspaceRoot || {}) };
 }
 
 function normalizeValue(value) {

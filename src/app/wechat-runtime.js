@@ -290,7 +290,7 @@ class WechatRuntime {
       case "switch":
         await this.handleSwitchCommand(normalized);
         return true;
-      case "message":
+      case "inspect_message":
         await this.handleMessageCommand(normalized);
         return true;
       case "stop":
@@ -371,6 +371,7 @@ class WechatRuntime {
     }
 
     const { bindingKey, workspaceRoot } = workspaceContext;
+    const hasPendingNewThread = this.sessionStore.hasPendingNewThreadForWorkspace(bindingKey, workspaceRoot);
     const { threads, threadId } = await this.resolveWorkspaceThreadState({
       bindingKey,
       workspaceRoot,
@@ -381,7 +382,7 @@ class WechatRuntime {
     const status = this.describeWorkspaceStatus(threadId);
     await this.sendReplyToNormalized(normalized, [
       `workspace: ${workspaceRoot}`,
-      `thread: ${threadId || "(none)"}`,
+      `thread: ${hasPendingNewThread ? "(new draft)" : (threadId || "(none)")}`,
       `status: ${status.label}`,
       `model: ${codexParams.model || "(default)"}`,
       `effort: ${codexParams.effort || "(default)"}`,
@@ -407,8 +408,12 @@ class WechatRuntime {
     const activeWorkspaceRoot = this.sessionStore.getActiveWorkspaceRoot(bindingKey);
     const lines = workspaceRoots.map((workspaceRoot) => {
       const threadId = this.sessionStore.getThreadIdForWorkspace(bindingKey, workspaceRoot);
+      const hasPendingNewThread = this.sessionStore.hasPendingNewThreadForWorkspace(bindingKey, workspaceRoot);
       const prefix = workspaceRoot === activeWorkspaceRoot ? "* " : "- ";
-      return `${prefix}${workspaceRoot}${threadId ? `\n  thread: ${threadId}` : ""}`;
+      const threadText = hasPendingNewThread
+        ? "\n  thread: (new draft)"
+        : (threadId ? `\n  thread: ${threadId}` : "");
+      return `${prefix}${workspaceRoot}${threadText}`;
     });
     await this.sendReplyToNormalized(normalized, lines.join("\n"));
   }
@@ -419,14 +424,11 @@ class WechatRuntime {
       return;
     }
     const { bindingKey, workspaceRoot } = workspaceContext;
-    const threadId = await this.createWorkspaceThread({
-      bindingKey,
-      workspaceRoot,
-      normalized,
-    });
+    this.sessionStore.setPendingNewThreadForWorkspace(bindingKey, workspaceRoot, true);
+    this.sessionStore.clearThreadIdForWorkspace(bindingKey, workspaceRoot);
     await this.sendReplyToNormalized(
       normalized,
-      `已创建新线程并切换到它。\n\nworkspace: ${workspaceRoot}\nthread: ${threadId}`
+      `已切换到新线程草稿。\n\nworkspace: ${workspaceRoot}\n下一条普通消息会在新线程中开始。`
     );
   }
 
@@ -451,6 +453,7 @@ class WechatRuntime {
 
     const resolvedWorkspaceRoot = selectedThread.cwd || workspaceRoot;
     this.sessionStore.setActiveWorkspaceRoot(bindingKey, resolvedWorkspaceRoot);
+    this.sessionStore.setPendingNewThreadForWorkspace(bindingKey, resolvedWorkspaceRoot, false);
     this.sessionStore.setThreadIdForWorkspace(
       bindingKey,
       resolvedWorkspaceRoot,
@@ -471,6 +474,10 @@ class WechatRuntime {
       return;
     }
     const { bindingKey, workspaceRoot } = workspaceContext;
+    if (this.sessionStore.hasPendingNewThreadForWorkspace(bindingKey, workspaceRoot)) {
+      await this.sendReplyToNormalized(normalized, "当前是新线程草稿，还没有历史消息。先发送一条普通消息开始。");
+      return;
+    }
     const { threads, threadId } = await this.resolveWorkspaceThreadState({
       bindingKey,
       workspaceRoot,
@@ -483,7 +490,17 @@ class WechatRuntime {
     }
 
     this.resumedThreadIds.delete(threadId);
-    const resumeResponse = await this.ensureThreadResumed(threadId);
+    let resumeResponse = null;
+    try {
+      resumeResponse = await this.ensureThreadResumed(threadId);
+    } catch (error) {
+      if (!isNoRolloutFoundError(error)) {
+        throw error;
+      }
+      this.sessionStore.clearThreadIdForWorkspace(bindingKey, workspaceRoot);
+      await this.sendReplyToNormalized(normalized, "当前线程还没有历史消息。先发送一条普通消息开始。");
+      return;
+    }
     const recentMessages = codexMessageUtils.extractRecentConversationFromResumeResponse(resumeResponse);
     const currentThread = threads.find((thread) => thread.id === threadId) || { id: threadId };
     const lines = [
@@ -775,8 +792,11 @@ class WechatRuntime {
 
   async resolveWorkspaceThreadState({ bindingKey, workspaceRoot, normalized, autoSelectThread = true }) {
     const threads = await this.refreshWorkspaceThreads(bindingKey, workspaceRoot, normalized);
+    const hasPendingNewThread = this.sessionStore.hasPendingNewThreadForWorkspace(bindingKey, workspaceRoot);
     const selectedThreadId = this.sessionStore.getThreadIdForWorkspace(bindingKey, workspaceRoot);
-    const threadId = selectedThreadId || (autoSelectThread ? (threads[0]?.id || "") : "");
+    const threadId = hasPendingNewThread
+      ? ""
+      : (selectedThreadId || (autoSelectThread ? (threads[0]?.id || "") : ""));
     if (!selectedThreadId && threadId) {
       this.sessionStore.setThreadIdForWorkspace(
         bindingKey,
@@ -911,6 +931,7 @@ class WechatRuntime {
     if (!threadId) {
       throw new Error("thread/start did not return a thread id");
     }
+    this.sessionStore.setPendingNewThreadForWorkspace(bindingKey, workspaceRoot, false);
     this.sessionStore.setThreadIdForWorkspace(
       bindingKey,
       workspaceRoot,
@@ -1239,7 +1260,13 @@ class WechatRuntime {
 
 function shouldRecreateThread(error) {
   const message = String(error?.message || "").toLowerCase();
-  return message.includes("thread not found") || message.includes("unknown thread");
+  return message.includes("thread not found")
+    || message.includes("unknown thread")
+    || message.includes("no rollout found");
+}
+
+function isNoRolloutFoundError(error) {
+  return String(error?.message || "").toLowerCase().includes("no rollout found");
 }
 
 function sleep(ms) {

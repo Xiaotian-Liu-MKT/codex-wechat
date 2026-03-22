@@ -61,7 +61,7 @@ function parseCommand(text) {
   const exactCommands = {
     stop: ["stop"],
     where: ["where"],
-    message: ["message"],
+    inspect_message: ["message"],
     help: ["help"],
     workspace: ["workspace"],
     new: ["new"],
