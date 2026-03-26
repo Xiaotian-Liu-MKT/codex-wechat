@@ -154,3 +154,6 @@ node ./bin/codex-wechat.js start
 - [ ] codex执行完任务后输出信息可能超过单条消息上限导致截断，优化消息提示
 
 - [ ] 支持Plan模式
+
+## 实验性的功能：
+- 微信上产生的任务可以在本机的codex上看到（feat/historyShare分支实现）
