@@ -67,6 +67,7 @@ npm install
 ## 运维文档
 
 - 日常启动、重启、目录预设、权限模式和故障排查，见 [OPERATIONS.md](./OPERATIONS.md)
+- 后续功能规划与优先级，见 [ROADMAP.md](./ROADMAP.md)
 
 ## 配置
 
@@ -218,10 +219,15 @@ node ./bin/codex-wechat.js start
 - 如果改了 `~/.codex-wechat/sessions.json` 这类运行状态文件，例如手动添加工作目录预设，运行中的进程不会自动热重载；需要重启 `codex-wechat` 才会生效。
 - Plan mode 生成完成后，完整计划会保存到当前项目目录下的 `.codex-wechat/plans/`，微信里只回压缩摘要。
 
-## 后续计划：
-- [ ] codex在执行长一点的任务时，只会在执行完成后输出消息，优化提示，告诉用户任务执行中
+## 后续计划
 
-- [ ] codex执行完任务后输出信息可能超过单条消息上限导致截断，优化消息提示
+- 长任务过程中的阶段性进度提示，而不只是完成后一次性回包
+- 超长结果的摘要优先与文件落盘交付
+- `Plan mode` 的历史版本、执行回写和完整闭环
+- `feat/historyShare` 主线化
+- 更完整的入站附件工作流
+
+更详细的优先级和范围，见 [ROADMAP.md](./ROADMAP.md)。
 
 ## 实验性的功能：
 - 微信上产生的任务可以在本机的codex上看到（`feat/historyShare` 分支实现）
