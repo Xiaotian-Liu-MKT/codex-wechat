@@ -1379,7 +1379,7 @@ class WechatRuntime {
     const mode = forceMode || this.sessionStore.getWorkspaceMode(bindingKey, workspaceRoot);
     const codexParams = this.getCodexParamsForWorkspace(bindingKey, workspaceRoot);
     const model = options.model || codexParams.model || "";
-    if (!model || (mode !== "plan" && mode !== "default")) {
+    if (!model || mode !== "plan") {
       return null;
     }
 
