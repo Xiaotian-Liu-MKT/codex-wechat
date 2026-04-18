@@ -44,14 +44,11 @@ function mapCodexMessageToImEvent(message) {
     };
   }
 
-  if (method === "turn/started" || method === "turn/start") {
+  const progressUpdate = extractProgressUpdate(message);
+  if (progressUpdate) {
     return {
       type: "im.run_state",
-      payload: {
-        threadId,
-        turnId,
-        state: "streaming",
-      },
+      payload: progressUpdate,
     };
   }
 
@@ -103,6 +100,148 @@ function mapCodexMessageToImEvent(message) {
   }
 
   return null;
+}
+
+function extractProgressUpdate(message) {
+  const method = message?.method;
+  const params = message?.params || {};
+  const threadId = extractThreadIdentifier(params);
+  const turnId = extractTurnIdentifier(params);
+
+  if (!threadId) {
+    return null;
+  }
+
+  if (method === "turn/started" || method === "turn/start") {
+    return {
+      threadId,
+      turnId,
+      state: "streaming",
+      phase: "started",
+      text: "已收到，开始处理。",
+    };
+  }
+
+  if (method === "turn/diff/updated") {
+    return {
+      threadId,
+      turnId,
+      state: "streaming",
+      phase: "editing",
+      text: "正在修改工作区文件。",
+    };
+  }
+
+  if (method !== "item/started") {
+    return null;
+  }
+
+  const phase = classifyProgressPhase(params);
+  if (!phase) {
+    return null;
+  }
+
+  return {
+    threadId,
+    turnId,
+    state: "streaming",
+    phase,
+    text: buildProgressText(phase),
+  };
+}
+
+function classifyProgressPhase(params) {
+  const itemType = extractProgressItemType(params);
+  const itemPhase = extractProgressItemPhase(params);
+  if (!itemType) {
+    return null;
+  }
+
+  if (itemType === "usermessage") {
+    return null;
+  }
+
+  if (itemType.includes("plan")) {
+    return "planning";
+  }
+
+  if (itemType === "agentmessage") {
+    if (itemPhase === "commentary") {
+      return "working";
+    }
+    if (itemPhase === "final_answer") {
+      return "replying";
+    }
+    return "working";
+  }
+
+  if (itemType === "reasoning") {
+    return "working";
+  }
+
+  if (itemType === "commandexecution") {
+    return "working";
+  }
+
+  if (
+    itemType.includes("command")
+    || itemType.includes("exec")
+    || itemType.includes("tool")
+    || itemType.includes("patch")
+    || itemType.includes("diff")
+  ) {
+    return "working";
+  }
+
+  return "working";
+}
+
+function extractProgressItemType(params) {
+  const candidates = [
+    params?.item?.type,
+    params?.item?.kind,
+    params?.item?.subtype,
+    params?.item?.name,
+  ];
+
+  for (const value of candidates) {
+    if (typeof value === "string" && value.trim()) {
+      return value.trim().toLowerCase();
+    }
+  }
+
+  return "";
+}
+
+function extractProgressItemPhase(params) {
+  const candidates = [
+    params?.item?.phase,
+    params?.phase,
+  ];
+
+  for (const value of candidates) {
+    if (typeof value === "string" && value.trim()) {
+      return value.trim().toLowerCase();
+    }
+  }
+
+  return "";
+}
+
+function buildProgressText(phase) {
+  switch (phase) {
+    case "planning":
+      return "正在规划实现步骤。";
+    case "editing":
+      return "正在修改工作区文件。";
+    case "replying":
+      return "正在整理结果并生成回复。";
+    case "working":
+      return "正在执行任务步骤。";
+    case "started":
+    default:
+      return "已收到，开始处理。";
+  }
 }
 
 function trackRunningTurn(activeTurnIdByThreadId, message) {

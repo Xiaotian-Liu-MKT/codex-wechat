@@ -60,6 +60,7 @@ const BACKOFF_DELAY_MS = 30_000;
 const MAX_CONSECUTIVE_FAILURES = 3;
 const TYPING_KEEPALIVE_MS = 5_000;
 const CHUNK_SEND_DELAY_MS = 350;
+const PROGRESS_NOTICE_COOLDOWN_MS = 12_000;
 const PLAN_FILE_DIR = ".codex-wechat/plans";
 const THREAD_SOURCE_KINDS = new Set([
   "app",
@@ -93,6 +94,7 @@ class WechatRuntime {
     this.replyBufferByRunKey = new Map();
     this.planStateByRunKey = new Map();
     this.planDeltaBufferByRunKey = new Map();
+    this.progressNoticeByRunKey = new Map();
     this.typingStopByThreadId = new Map();
     this.bindingKeyByThreadId = new Map();
     this.workspaceRootByThreadId = new Map();
@@ -1914,6 +1916,7 @@ class WechatRuntime {
     const bindingKey = this.bindingKeyByThreadId.get(threadId) || "";
 
     if (outbound.payload.state === "streaming") {
+      await this.handleProgressNotice(outbound, runKey);
       return;
     }
 
@@ -1933,6 +1936,7 @@ class WechatRuntime {
         this.replyBufferByRunKey.delete(runKey);
         this.planStateByRunKey.delete(runKey);
         this.planDeltaBufferByRunKey.delete(runKey);
+        this.progressNoticeByRunKey.delete(runKey);
         this.activeTurnIdByThreadId.delete(threadId);
         this.pendingApprovalByThreadId.delete(threadId);
         return;
@@ -1991,6 +1995,7 @@ class WechatRuntime {
       this.replyBufferByRunKey.delete(runKey);
       this.planStateByRunKey.delete(runKey);
       this.planDeltaBufferByRunKey.delete(runKey);
+      this.progressNoticeByRunKey.delete(runKey);
       this.activeTurnIdByThreadId.delete(threadId);
       this.pendingApprovalByThreadId.delete(threadId);
       return;
@@ -2024,8 +2029,34 @@ class WechatRuntime {
     this.replyBufferByRunKey.delete(runKey);
     this.planStateByRunKey.delete(runKey);
     this.planDeltaBufferByRunKey.delete(runKey);
+    this.progressNoticeByRunKey.delete(runKey);
     this.activeTurnIdByThreadId.delete(threadId);
     this.pendingApprovalByThreadId.delete(threadId);
+  }
+
+  async handleProgressNotice(outbound, runKey) {
+    const threadId = outbound.payload?.threadId || "";
+    const context = this.pendingChatContextByThreadId.get(threadId);
+    const phase = typeof outbound.payload?.phase === "string" ? outbound.payload.phase.trim() : "";
+    const text = typeof outbound.payload?.text === "string" ? outbound.payload.text.trim() : "";
+    if (!threadId || !context || !phase || !text) {
+      return;
+    }
+
+    const now = Date.now();
+    const previous = this.progressNoticeByRunKey.get(runKey) || null;
+    const shouldSend = !previous
+      || previous.phase !== phase
+      || (now - previous.sentAt) >= PROGRESS_NOTICE_COOLDOWN_MS;
+    if (!shouldSend) {
+      return;
+    }
+
+    await this.sendReplyToUser(context.senderId, text, context.contextToken);
+    this.progressNoticeByRunKey.set(runKey, {
+      phase,
+      sentAt: now,
+    });
   }
 }
 
