@@ -17,6 +17,47 @@ OpenClaw 不再作为运行时参与；这里只借用了 `@tencent-weixin/openc
 - `/codex new` 会切到新会话
 - 支持微信内 `/codex ...` 控制命令
 
+## 仓库关系
+
+- 源仓库：`upstream -> https://github.com/demoadminjie/codex-wechat.git`
+- 你的仓库：`origin -> https://github.com/Xiaotian-Liu-MKT/codex-wechat.git`
+- 当前 `main` 基于 `upstream/main`，并额外叠加了你的本地增强功能提交
+
+## 功能来源
+
+### 源仓库已有能力
+
+- 微信扫码登录并保存账号状态
+- 微信消息长轮询与发送消息
+- 连接本地 `codex app-server`
+- 按微信用户维护 Codex 线程
+- 基础命令集，例如 `/codex bind`、`/codex where`、`/codex new`、`/codex switch`、`/codex model`、`/codex effort`、`/codex approve`
+- 基础文件发送能力，包括把项目内文件发回微信
+
+### 你的 fork 额外增强
+
+- `Plan mode`
+  - `/codex plan`
+  - `/codex plan status`
+  - `/codex plan show`
+  - `/codex execute`
+  - `/codex exit plan`
+  - 计划会落盘到项目内 `.codex-wechat/plans/`
+- 工作目录预设
+  - `/codex preset list`
+  - `/codex preset add <别名> <绝对路径>`
+  - `/codex preset remove <别名>`
+  - `/codex use <序号|别名>`
+- 更适合微信阅读的结果回包
+  - 区分计划摘要、任务完成、长提示词/大段代码等不同输出类型
+  - 按 UTF-8 字节长度切分长消息，降低中文内容被截断的风险
+- 更稳的微信发送错误处理
+  - 主动检查 `sendMessage` 返回值并抛出 API 级错误，而不是静默失败
+- 运维增强
+  - 新增 [OPERATIONS.md](./OPERATIONS.md)
+  - 新增 `scripts/launchd-start.sh`，方便用 `launchd` 托管
+  - README 中补充了单实例运行、网络权限、会话文件热加载限制等操作说明
+
 ## 安装
 
 ```bash
@@ -182,7 +223,6 @@ node ./bin/codex-wechat.js start
 
 - [ ] codex执行完任务后输出信息可能超过单条消息上限导致截断，优化消息提示
 
-- [ ] 支持Plan模式
-
 ## 实验性的功能：
-- 微信上产生的任务可以在本机的codex上看到（feat/historyShare分支实现）
+- 微信上产生的任务可以在本机的codex上看到（`feat/historyShare` 分支实现）
+- 当前 `main` 已额外支持 Plan mode、工作目录预设和更稳的微信回包格式
