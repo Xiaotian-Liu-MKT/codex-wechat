@@ -146,6 +146,7 @@ class CodexRpcClient {
     effort = null,
     accessMode = null,
     workspaceRoot = "",
+    collaborationMode = null,
   }) {
     const input = buildTurnInputPayload(text);
     return threadId
@@ -158,6 +159,7 @@ class CodexRpcClient {
           effort,
           accessMode,
           workspaceRoot,
+          collaborationMode,
         })
       )
       : this.sendRequest("thread/start", { input });
@@ -360,11 +362,24 @@ function buildTurnInputPayload(text) {
   return items;
 }
 
-function buildTurnStartParams({ threadId, input, model, effort, accessMode, workspaceRoot }) {
+function buildTurnStartParams({
+  threadId,
+  input,
+  model,
+  effort,
+  accessMode,
+  workspaceRoot,
+  collaborationMode,
+}) {
   const params = { threadId, input };
   const normalizedModel = normalizeNonEmptyString(model);
   const normalizedEffort = normalizeNonEmptyString(effort);
   const normalizedAccessMode = normalizeAccessMode(accessMode);
+  const normalizedCollaborationMode = normalizeCollaborationMode({
+    collaborationMode,
+    model: normalizedModel,
+    effort: normalizedEffort,
+  });
   const executionPolicies = buildExecutionPolicies(normalizedAccessMode, workspaceRoot);
   if (normalizedModel) {
     params.model = normalizedModel;
@@ -377,7 +392,57 @@ function buildTurnStartParams({ threadId, input, model, effort, accessMode, work
   }
   params.approvalPolicy = executionPolicies.approvalPolicy;
   params.sandboxPolicy = executionPolicies.sandboxPolicy;
+  if (normalizedCollaborationMode) {
+    params.collaborationMode = normalizedCollaborationMode;
+  }
   return params;
+}
+
+function normalizeCollaborationMode({ collaborationMode, model, effort }) {
+  if (!collaborationMode || typeof collaborationMode !== "object") {
+    return null;
+  }
+
+  const normalizedMode = normalizeNonEmptyString(collaborationMode.mode).toLowerCase();
+  if (normalizedMode !== "plan" && normalizedMode !== "default") {
+    return null;
+  }
+
+  const normalizedModel = normalizeNonEmptyString(
+    collaborationMode.settings?.model || collaborationMode.model || model
+  );
+  if (!normalizedModel) {
+    return null;
+  }
+
+  const normalizedEffort = normalizeNonEmptyString(
+    collaborationMode.settings?.reasoning_effort
+      || collaborationMode.settings?.reasoningEffort
+      || collaborationMode.reasoning_effort
+      || collaborationMode.reasoningEffort
+      || effort
+  );
+  const developerInstructions = normalizeNullableString(
+    collaborationMode.settings?.developer_instructions
+      || collaborationMode.settings?.developerInstructions
+      || collaborationMode.developer_instructions
+      || collaborationMode.developerInstructions
+  );
+
+  const settings = {
+    model: normalizedModel,
+  };
+  if (normalizedEffort) {
+    settings.reasoning_effort = normalizedEffort;
+  }
+  if (developerInstructions !== null) {
+    settings.developer_instructions = developerInstructions;
+  }
+
+  return {
+    mode: normalizedMode,
+    settings,
+  };
 }
 
 function normalizeAccessMode(value) {
@@ -386,6 +451,13 @@ function normalizeAccessMode(value) {
     return "current";
   }
   return normalized === "full-access" ? normalized : "";
+}
+
+function normalizeNullableString(value) {
+  if (value == null) {
+    return null;
+  }
+  return normalizeNonEmptyString(value) || null;
 }
 
 function buildExecutionPolicies(accessMode, workspaceRoot) {

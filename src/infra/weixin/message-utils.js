@@ -191,6 +191,10 @@ function parseCommand(text) {
     inspect_message: ["message"],
     help: ["help"],
     workspace: ["workspace"],
+    plan: ["plan", "plan status", "plan show"],
+    execute: ["execute"],
+    exit_plan: ["exit plan", "mode default"],
+    preset: ["preset", "preset list"],
     new: ["new"],
     model: ["model", "model update"],
     effort: ["effort"],
@@ -207,8 +211,14 @@ function parseCommand(text) {
   if (matchesPrefixCommand(normalized, "switch")) {
     return "switch";
   }
+  if (matchesPrefixCommand(normalized, "use")) {
+    return "use";
+  }
   if (matchesPrefixCommand(normalized, "bind")) {
     return "bind";
+  }
+  if (matchesPrefixCommand(normalized, "preset")) {
+    return "preset";
   }
   if (matchesPrefixCommand(normalized, "remove")) {
     return "remove";
@@ -248,7 +258,11 @@ function markdownToPlainText(text) {
   return result.trim();
 }
 
-function chunkReplyText(text, limit = 3500) {
+function utf8ByteLength(text) {
+  return Buffer.byteLength(String(text || ""), "utf8");
+}
+
+function chunkReplyText(text, limit = 3000) {
   const normalized = String(text || "").trim();
   if (!normalized) {
     return [];
@@ -256,8 +270,8 @@ function chunkReplyText(text, limit = 3500) {
 
   const chunks = [];
   let remaining = normalized;
-  while (remaining.length > limit) {
-    const candidate = remaining.slice(0, limit);
+  while (utf8ByteLength(remaining) > limit) {
+    const candidate = sliceUtf8TextByBytes(remaining, limit);
     const splitIndex = Math.max(
       candidate.lastIndexOf("\n\n"),
       candidate.lastIndexOf("\n"),
@@ -265,14 +279,37 @@ function chunkReplyText(text, limit = 3500) {
       candidate.lastIndexOf(". "),
       candidate.lastIndexOf(" ")
     );
-    const cut = splitIndex > limit * 0.4 ? splitIndex + (candidate[splitIndex] === "\n" ? 0 : 1) : limit;
+    const candidateBytes = utf8ByteLength(candidate);
+    const cut = splitIndex > candidate.length * 0.4 ? splitIndex + (candidate[splitIndex] === "\n" ? 0 : 1) : candidate.length;
     chunks.push(remaining.slice(0, cut).trim());
     remaining = remaining.slice(cut).trim();
+    if (utf8ByteLength(remaining) === candidateBytes) {
+      break;
+    }
   }
   if (remaining) {
     chunks.push(remaining);
   }
   return chunks.filter(Boolean);
+}
+
+function sliceUtf8TextByBytes(text, maxBytes) {
+  const normalized = String(text || "");
+  if (!normalized || maxBytes <= 0) {
+    return "";
+  }
+
+  let bytes = 0;
+  let end = 0;
+  for (const char of normalized) {
+    const nextBytes = bytes + utf8ByteLength(char);
+    if (nextBytes > maxBytes) {
+      break;
+    }
+    bytes = nextBytes;
+    end += char.length;
+  }
+  return normalized.slice(0, end);
 }
 
 function normalizeText(value) {
@@ -286,4 +323,5 @@ module.exports = {
   markdownToPlainText,
   normalizeWeixinIncomingMessage,
   parseCommand,
+  utf8ByteLength,
 };

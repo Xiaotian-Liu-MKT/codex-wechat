@@ -23,6 +23,10 @@ OpenClaw 不再作为运行时参与；这里只借用了 `@tencent-weixin/openc
 npm install
 ```
 
+## 运维文档
+
+- 日常启动、重启、目录预设、权限模式和故障排查，见 [OPERATIONS.md](./OPERATIONS.md)
+
 ## 配置
 
 复制 `.env.example` 到 `.env`，常用项：
@@ -88,6 +92,24 @@ node ./bin/codex-wechat.js start
   - 查看当前会话绑定的项目、线程、运行状态、模型和推理强度
 - `/codex workspace`
   - 查看当前会话记录过的所有项目绑定，以及每个项目当前选中的线程
+- `/codex plan`
+  - 进入当前工作区的 Plan mode；后续普通消息只用于生成计划，不直接执行
+- `/codex plan status`
+  - 查看当前工作区是否处于 Plan mode，以及最近一份计划是否可执行
+- `/codex plan show`
+  - 查看当前工作区最近一份计划的压缩摘要，以及详细计划文件路径
+- `/codex execute`
+  - 在同一线程中按最近一份已保存计划继续执行
+- `/codex exit plan`
+  - 退出当前工作区的 Plan mode
+- `/codex preset list`
+  - 查看当前微信会话保存的常用工作目录预设，以及对应序号
+- `/codex preset add <别名> <绝对路径>`
+  - 为当前微信会话保存一个常用工作目录预设，后续可通过别名快速切换
+- `/codex preset remove <别名>`
+  - 删除当前微信会话中的一个工作目录预设
+- `/codex use <序号|别名>`
+  - 按预设序号或别名切换当前工作目录；比直接输入完整绝对路径更方便
 - `/codex new`
   - 切换到新会话；不会立刻创建空线程，下一条普通消息才会真正开始一个新线程
 - `/codex switch <threadId>`
@@ -147,6 +169,13 @@ node ./bin/codex-wechat.js start
 
 - 当前只支持文本控制链路；微信端富媒体入站不会自动送进 Codex。
 - 微信出站默认把 Markdown 压成纯文本后发送。
+
+## 运维说明
+
+- `codex-wechat` 只应该同时运行一个实例。多个实例会同时抢微信长轮询，表现为微信侧发消息无响应或时灵时不灵。
+- 如果你是在受限沙箱里启动它，可能会看到 `monitor error: fetch failed`，因为进程拿不到微信网络访问能力。遇到这种情况，要在能访问外网的正常终端环境里重启。
+- 如果改了 `~/.codex-wechat/sessions.json` 这类运行状态文件，例如手动添加工作目录预设，运行中的进程不会自动热重载；需要重启 `codex-wechat` 才会生效。
+- Plan mode 生成完成后，完整计划会保存到当前项目目录下的 `.codex-wechat/plans/`，微信里只回压缩摘要。
 
 ## 后续计划：
 - [ ] codex在执行长一点的任务时，只会在执行完成后输出消息，优化提示，告诉用户任务执行中

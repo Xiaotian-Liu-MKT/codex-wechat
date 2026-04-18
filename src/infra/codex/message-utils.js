@@ -271,6 +271,60 @@ function extractTurnFailureText(params) {
   return "执行失败";
 }
 
+function extractPlanUpdate(message) {
+  const method = message?.method;
+  if (method !== "turn/plan/updated") {
+    return null;
+  }
+
+  const params = message?.params || {};
+  const threadId = extractThreadIdentifier(params);
+  const turnId = extractTurnIdentifier(params);
+  if (!threadId || !turnId) {
+    return null;
+  }
+
+  const rawPlan = Array.isArray(params.plan) ? params.plan : [];
+  const plan = rawPlan
+    .map((step) => ({
+      step: typeof step?.step === "string" ? step.step.trim() : "",
+      status: normalizeIdentifier(step?.status),
+    }))
+    .filter((step) => step.step);
+
+  return {
+    threadId,
+    turnId,
+    explanation: normalizeIdentifier(params.explanation),
+    plan,
+  };
+}
+
+function extractPlanDelta(message) {
+  const method = message?.method;
+  if (method !== "item/plan/delta") {
+    return null;
+  }
+
+  const params = message?.params || {};
+  const threadId = extractThreadIdentifier(params);
+  const turnId = extractTurnIdentifier(params);
+  if (!threadId || !turnId) {
+    return null;
+  }
+
+  const text = extractAssistantText(params);
+  if (!text) {
+    return null;
+  }
+
+  return {
+    threadId,
+    turnId,
+    text,
+  };
+}
+
 function parseEmbeddedErrorMessage(raw) {
   const message = normalizeIdentifier(raw);
   if (!message) {
@@ -539,7 +593,11 @@ function extractTextFromContent(content) {
         continue;
       }
       const entryType = String(entry.type || "").toLowerCase();
-      if (entryType === "text" && typeof entry.text === "string" && entry.text.trim()) {
+      if (
+        (entryType === "text" || entryType === "input_text" || entryType === "output_text")
+        && typeof entry.text === "string"
+        && entry.text.trim()
+      ) {
         parts.push(entry.text.trim());
       }
     }
@@ -561,6 +619,8 @@ module.exports = {
   buildApprovalResponsePayload,
   buildBindingMetadata,
   buildRunKey,
+  extractPlanDelta,
+  extractPlanUpdate,
   extractRecentConversationFromResumeResponse,
   extractThreadId,
   extractThreadListCursor,

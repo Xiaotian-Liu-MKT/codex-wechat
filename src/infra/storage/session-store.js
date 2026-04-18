@@ -50,6 +50,146 @@ class SessionStore {
     return Object.keys(getThreadMap(binding)).sort((left, right) => left.localeCompare(right));
   }
 
+  listWorkspacePresets(bindingKey) {
+    const binding = this.getBinding(bindingKey) || {};
+    return Object.values(getWorkspacePresetMap(binding))
+      .filter((item) => item && typeof item === "object")
+      .map((item) => ({
+        name: normalizePresetName(item.name),
+        workspaceRoot: normalizeValue(item.workspaceRoot),
+      }))
+      .filter((item) => item.name && item.workspaceRoot)
+      .sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  getWorkspacePreset(bindingKey, target) {
+    const normalizedTarget = normalizeValue(target);
+    if (!normalizedTarget) {
+      return null;
+    }
+
+    const presets = this.listWorkspacePresets(bindingKey);
+    if (/^\d+$/.test(normalizedTarget)) {
+      const index = Number.parseInt(normalizedTarget, 10) - 1;
+      return index >= 0 && index < presets.length ? presets[index] : null;
+    }
+
+    const normalizedKey = normalizePresetKey(normalizedTarget);
+    return presets.find((item) => normalizePresetKey(item.name) === normalizedKey) || null;
+  }
+
+  setWorkspacePreset(bindingKey, name, workspaceRoot) {
+    const normalizedName = normalizePresetName(name);
+    const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
+    if (!normalizedName || !normalizedWorkspaceRoot) {
+      return this.getBinding(bindingKey);
+    }
+
+    const current = this.getBinding(bindingKey) || {};
+    const workspacePresetsByName = {
+      ...getWorkspacePresetMap(current),
+      [normalizePresetKey(normalizedName)]: {
+        name: normalizedName,
+        workspaceRoot: normalizedWorkspaceRoot,
+      },
+    };
+
+    return this.updateBinding(bindingKey, {
+      ...current,
+      workspacePresetsByName,
+    });
+  }
+
+  getWorkspaceMode(bindingKey, workspaceRoot) {
+    const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
+    if (!normalizedWorkspaceRoot) {
+      return "default";
+    }
+    const raw = this.state.bindings[bindingKey]?.modeByWorkspaceRoot?.[normalizedWorkspaceRoot];
+    return normalizeWorkspaceMode(raw);
+  }
+
+  setWorkspaceMode(bindingKey, workspaceRoot, mode) {
+    const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
+    if (!normalizedWorkspaceRoot) {
+      return this.getBinding(bindingKey);
+    }
+
+    const current = this.getBinding(bindingKey) || {};
+    const modeByWorkspaceRoot = {
+      ...getWorkspaceModeMap(current),
+      [normalizedWorkspaceRoot]: normalizeWorkspaceMode(mode),
+    };
+
+    return this.updateBinding(bindingKey, {
+      ...current,
+      modeByWorkspaceRoot,
+    });
+  }
+
+  getPendingPlanForWorkspace(bindingKey, workspaceRoot) {
+    const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
+    if (!normalizedWorkspaceRoot) {
+      return null;
+    }
+    const raw = this.state.bindings[bindingKey]?.pendingPlanByWorkspaceRoot?.[normalizedWorkspaceRoot];
+    return normalizePendingPlan(raw);
+  }
+
+  setPendingPlanForWorkspace(bindingKey, workspaceRoot, plan) {
+    const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
+    const normalizedPlan = normalizePendingPlan(plan);
+    if (!normalizedWorkspaceRoot) {
+      return this.getBinding(bindingKey);
+    }
+
+    const current = this.getBinding(bindingKey) || {};
+    const pendingPlanByWorkspaceRoot = {
+      ...getPendingPlanMap(current),
+    };
+
+    if (normalizedPlan) {
+      pendingPlanByWorkspaceRoot[normalizedWorkspaceRoot] = normalizedPlan;
+    } else {
+      delete pendingPlanByWorkspaceRoot[normalizedWorkspaceRoot];
+    }
+
+    return this.updateBinding(bindingKey, {
+      ...current,
+      pendingPlanByWorkspaceRoot,
+    });
+  }
+
+  clearPendingPlanForWorkspace(bindingKey, workspaceRoot) {
+    return this.setPendingPlanForWorkspace(bindingKey, workspaceRoot, null);
+  }
+
+  markPendingPlanConsumed(bindingKey, workspaceRoot) {
+    const current = this.getPendingPlanForWorkspace(bindingKey, workspaceRoot);
+    if (!current) {
+      return this.getBinding(bindingKey);
+    }
+    return this.setPendingPlanForWorkspace(bindingKey, workspaceRoot, {
+      ...current,
+      status: "consumed",
+    });
+  }
+
+  removeWorkspacePreset(bindingKey, name) {
+    const normalizedKey = normalizePresetKey(name);
+    if (!normalizedKey) {
+      return this.getBinding(bindingKey);
+    }
+
+    const current = this.getBinding(bindingKey) || {};
+    const workspacePresetsByName = getWorkspacePresetMap(current);
+    delete workspacePresetsByName[normalizedKey];
+    return this.updateBinding(bindingKey, {
+      ...current,
+      workspacePresetsByName,
+    });
+  }
+
   hasPendingNewThreadForWorkspace(bindingKey, workspaceRoot) {
     const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
     if (!normalizedWorkspaceRoot) {
@@ -236,6 +376,8 @@ class SessionStore {
     const threadIdByWorkspaceRoot = getThreadMap(current);
     const codexParamsByWorkspaceRoot = getCodexParamsMap(current);
     const pendingNewThreadByWorkspaceRoot = getPendingNewThreadMap(current);
+    const modeByWorkspaceRoot = getWorkspaceModeMap(current);
+    const pendingPlanByWorkspaceRoot = getPendingPlanMap(current);
     const hasWorkspaceEntry = Object.prototype.hasOwnProperty.call(
       threadIdByWorkspaceRoot,
       normalizedWorkspaceRoot
@@ -248,6 +390,8 @@ class SessionStore {
     delete threadIdByWorkspaceRoot[normalizedWorkspaceRoot];
     delete codexParamsByWorkspaceRoot[normalizedWorkspaceRoot];
     delete pendingNewThreadByWorkspaceRoot[normalizedWorkspaceRoot];
+    delete modeByWorkspaceRoot[normalizedWorkspaceRoot];
+    delete pendingPlanByWorkspaceRoot[normalizedWorkspaceRoot];
 
     const nextActiveWorkspaceRoot = activeWorkspaceRoot === normalizedWorkspaceRoot
       ? (Object.keys(threadIdByWorkspaceRoot).sort((left, right) => left.localeCompare(right))[0] || "")
@@ -257,6 +401,8 @@ class SessionStore {
       ...current,
       activeWorkspaceRoot: nextActiveWorkspaceRoot,
       codexParamsByWorkspaceRoot,
+      modeByWorkspaceRoot,
+      pendingPlanByWorkspaceRoot,
       pendingNewThreadByWorkspaceRoot,
       threadIdByWorkspaceRoot,
     });
@@ -329,8 +475,68 @@ function getPendingNewThreadMap(binding) {
   return { ...(binding?.pendingNewThreadByWorkspaceRoot || {}) };
 }
 
+function getWorkspacePresetMap(binding) {
+  return { ...(binding?.workspacePresetsByName || {}) };
+}
+
+function getWorkspaceModeMap(binding) {
+  return { ...(binding?.modeByWorkspaceRoot || {}) };
+}
+
+function getPendingPlanMap(binding) {
+  return { ...(binding?.pendingPlanByWorkspaceRoot || {}) };
+}
+
 function normalizeValue(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizePresetName(value) {
+  return normalizeValue(value).replace(/\s+/g, " ");
+}
+
+function normalizePresetKey(value) {
+  return normalizePresetName(value).toLowerCase();
+}
+
+function normalizeWorkspaceMode(value) {
+  return normalizeValue(value).toLowerCase() === "plan" ? "plan" : "default";
+}
+
+function normalizePendingPlan(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const planId = normalizeValue(value.planId);
+  const threadId = normalizeValue(value.threadId);
+  const workspaceRoot = normalizeValue(value.workspaceRoot);
+  const summaryText = normalizeValue(value.summaryText);
+  const planFilePath = normalizeValue(value.planFilePath);
+  const createdAt = normalizeValue(value.createdAt);
+  const status = normalizePendingPlanStatus(value.status);
+
+  if (!planId || !workspaceRoot || !planFilePath) {
+    return null;
+  }
+
+  return {
+    planId,
+    threadId,
+    workspaceRoot,
+    summaryText,
+    planFilePath,
+    createdAt,
+    status,
+  };
+}
+
+function normalizePendingPlanStatus(value) {
+  const normalized = normalizeValue(value).toLowerCase();
+  if (normalized === "draft" || normalized === "consumed") {
+    return normalized;
+  }
+  return "ready";
 }
 
 function normalizeCommandTokens(tokens) {

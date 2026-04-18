@@ -95,7 +95,7 @@ async function getUpdates(params) {
 }
 
 async function sendMessage(params) {
-  await apiFetch({
+  const rawText = await apiFetch({
     baseUrl: params.baseUrl,
     endpoint: "ilink/bot/sendmessage",
     body: JSON.stringify({ ...params.body, base_info: buildBaseInfo() }),
@@ -103,6 +103,20 @@ async function sendMessage(params) {
     timeoutMs: params.timeoutMs || DEFAULT_API_TIMEOUT_MS,
     label: "sendMessage",
   });
+  let parsed = null;
+  try {
+    parsed = rawText ? JSON.parse(rawText) : {};
+  } catch {
+    parsed = { rawText };
+  }
+
+  const isApiError =
+    (parsed?.ret !== undefined && parsed.ret !== 0)
+    || (parsed?.errcode !== undefined && parsed.errcode !== 0);
+  if (isApiError) {
+    throw new Error(`sendMessage failed ret=${parsed.ret} errcode=${parsed.errcode} errmsg=${parsed.errmsg || ""}`);
+  }
+  return parsed;
 }
 
 async function getUploadUrl(params) {

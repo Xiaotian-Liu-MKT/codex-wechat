@@ -27,6 +27,9 @@ const {
   extractRemoveWorkspacePath,
   extractSendPath,
   extractSwitchThreadId,
+  extractUseTarget,
+  parsePlanCommand,
+  parsePresetCommand,
 } = require("../shared/command-parsing");
 const {
   filterThreadsByWorkspaceRoot,
@@ -41,6 +44,14 @@ const {
   resolveEffectiveModelForEffort,
 } = require("../shared/model-catalog");
 const { formatFailureText } = require("../shared/error-text");
+const {
+  buildPlanSummaryText,
+  formatPlanCompletionReply,
+  formatPromptDeliveryReply,
+  formatTaskCompletionReply,
+  formatTaskFailureReply,
+  shouldUsePromptDelivery,
+} = require("../shared/wechat-reply-format");
 
 const SESSION_EXPIRED_ERRCODE = -14;
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
@@ -48,6 +59,8 @@ const RETRY_DELAY_MS = 2_000;
 const BACKOFF_DELAY_MS = 30_000;
 const MAX_CONSECUTIVE_FAILURES = 3;
 const TYPING_KEEPALIVE_MS = 5_000;
+const CHUNK_SEND_DELAY_MS = 350;
+const PLAN_FILE_DIR = ".codex-wechat/plans";
 const THREAD_SOURCE_KINDS = new Set([
   "app",
   "cli",
@@ -78,6 +91,8 @@ class WechatRuntime {
     this.pendingApprovalByThreadId = new Map();
     this.currentRunKeyByThreadId = new Map();
     this.replyBufferByRunKey = new Map();
+    this.planStateByRunKey = new Map();
+    this.planDeltaBufferByRunKey = new Map();
     this.typingStopByThreadId = new Map();
     this.bindingKeyByThreadId = new Map();
     this.workspaceRootByThreadId = new Map();
@@ -323,8 +338,23 @@ class WechatRuntime {
       case "workspace":
         await this.handleWorkspaceCommand(normalized);
         return true;
+      case "preset":
+        await this.handlePresetCommand(normalized);
+        return true;
+      case "plan":
+        await this.handlePlanCommand(normalized);
+        return true;
+      case "execute":
+        await this.handleExecuteCommand(normalized);
+        return true;
+      case "exit_plan":
+        await this.handleExitPlanCommand(normalized);
+        return true;
       case "new":
         await this.handleNewCommand(normalized);
+        return true;
+      case "use":
+        await this.handleUseCommand(normalized);
         return true;
       case "switch":
         await this.handleSwitchCommand(normalized);
@@ -369,23 +399,236 @@ class WechatRuntime {
       return;
     }
 
-    const workspaceRoot = normalizeWorkspacePath(rawWorkspaceRoot);
-    if (!isAbsoluteWorkspacePath(workspaceRoot)) {
-      await this.sendReplyToNormalized(normalized, "只支持绝对路径绑定。");
-      return;
-    }
-    if (!isWorkspaceAllowed(workspaceRoot, this.config.workspaceAllowlist)) {
-      await this.sendReplyToNormalized(normalized, "该项目不在允许绑定的白名单中。");
+    await this.bindWorkspaceRoot(normalized, rawWorkspaceRoot);
+  }
+
+  async handlePresetCommand(normalized) {
+    const bindingKey = this.sessionStore.buildBindingKey(normalized);
+    const parsed = parsePresetCommand(normalized.text);
+    if (!parsed.action) {
+      await this.sendReplyToNormalized(
+        normalized,
+        "用法:\n/codex preset list\n/codex preset add <别名> <绝对路径>\n/codex preset remove <别名>"
+      );
       return;
     }
 
-    const workspaceStats = await this.resolveWorkspaceStats(workspaceRoot);
-    if (!workspaceStats.exists) {
-      await this.sendReplyToNormalized(normalized, `项目不存在: ${workspaceRoot}`);
+    if (parsed.action === "list") {
+      const presets = this.sessionStore.listWorkspacePresets(bindingKey);
+      if (!presets.length) {
+        await this.sendReplyToNormalized(normalized, "当前还没有常用目录预设。");
+        return;
+      }
+      const activeWorkspaceRoot = this.sessionStore.getActiveWorkspaceRoot(bindingKey);
+      const lines = ["常用目录："];
+      for (let index = 0; index < presets.length; index += 1) {
+        const preset = presets[index];
+        const prefix = preset.workspaceRoot === activeWorkspaceRoot ? "* " : "";
+        lines.push(`${index + 1}. ${prefix}${preset.name} -> ${preset.workspaceRoot}`);
+      }
+      lines.push("");
+      lines.push("切换示例: `/codex use 1` 或 `/codex use pb`");
+      await this.sendReplyToNormalized(normalized, lines.join("\n"));
       return;
     }
-    if (!workspaceStats.isDirectory) {
-      await this.sendReplyToNormalized(normalized, `路径非法: ${workspaceRoot}`);
+
+    if (parsed.action === "remove") {
+      if (!parsed.name) {
+        await this.sendReplyToNormalized(normalized, "用法: `/codex preset remove <别名>`");
+        return;
+      }
+      const existing = this.sessionStore.getWorkspacePreset(bindingKey, parsed.name);
+      if (!existing) {
+        await this.sendReplyToNormalized(normalized, `未找到预设: ${parsed.name}`);
+        return;
+      }
+      this.sessionStore.removeWorkspacePreset(bindingKey, parsed.name);
+      await this.sendReplyToNormalized(normalized, `已删除预设: ${existing.name}`);
+      return;
+    }
+
+    if (!parsed.name || !parsed.workspaceRoot) {
+      await this.sendReplyToNormalized(normalized, "用法: `/codex preset add <别名> <绝对路径>`");
+      return;
+    }
+
+    if (!/^[\p{L}\p{N}_-]+$/u.test(parsed.name)) {
+      await this.sendReplyToNormalized(normalized, "预设别名只允许字母、数字、下划线和中划线。");
+      return;
+    }
+
+    const resolvedWorkspaceRoot = await this.validateWorkspaceRoot(parsed.workspaceRoot, normalized);
+    if (!resolvedWorkspaceRoot) {
+      return;
+    }
+
+    this.sessionStore.setWorkspacePreset(bindingKey, parsed.name, resolvedWorkspaceRoot);
+    await this.sendReplyToNormalized(
+      normalized,
+      `已保存预设。\n\nname: ${parsed.name}\nworkspace: ${resolvedWorkspaceRoot}\n\n可用 \`/codex use ${parsed.name}\` 快速切换。`
+    );
+  }
+
+  async handleUseCommand(normalized) {
+    const target = extractUseTarget(normalized.text);
+    if (!target) {
+      await this.sendReplyToNormalized(normalized, "用法: `/codex use <序号|别名>`");
+      return;
+    }
+
+    const bindingKey = this.sessionStore.buildBindingKey(normalized);
+    const preset = this.sessionStore.getWorkspacePreset(bindingKey, target);
+    if (!preset) {
+      const presets = this.sessionStore.listWorkspacePresets(bindingKey);
+      if (!presets.length) {
+        await this.sendReplyToNormalized(normalized, "当前还没有常用目录预设。先用 `/codex preset add <别名> <绝对路径>` 添加。");
+        return;
+      }
+      await this.sendReplyToNormalized(normalized, `未找到预设: ${target}\n先发 \`/codex preset list\` 查看可用序号和别名。`);
+      return;
+    }
+
+    await this.bindWorkspaceRoot(normalized, preset.workspaceRoot, `已切换到预设 ${preset.name}`);
+  }
+
+  async handlePlanCommand(normalized) {
+    const parsed = parsePlanCommand(normalized.text);
+    const workspaceContext = await this.resolveWorkspaceContext(normalized);
+    if (!workspaceContext) {
+      return;
+    }
+    const { bindingKey, workspaceRoot } = workspaceContext;
+
+    if (parsed.action === "status") {
+      const mode = this.sessionStore.getWorkspaceMode(bindingKey, workspaceRoot);
+      const pendingPlan = this.sessionStore.getPendingPlanForWorkspace(bindingKey, workspaceRoot);
+      const lines = [
+        `workspace: ${workspaceRoot}`,
+        `mode: ${mode}`,
+        `plan: ${pendingPlan ? pendingPlan.status : "(none)"}`,
+      ];
+      if (pendingPlan?.planFilePath) {
+        lines.push(`plan_file: ${pendingPlan.planFilePath}`);
+      }
+      await this.sendReplyToNormalized(normalized, lines.join("\n"));
+      return;
+    }
+
+    if (parsed.action === "show") {
+      const pendingPlan = this.sessionStore.getPendingPlanForWorkspace(bindingKey, workspaceRoot);
+      if (!pendingPlan) {
+        await this.sendReplyToNormalized(normalized, "当前工作区还没有已保存的计划。先进入 Plan mode 并发送一条任务描述。");
+        return;
+      }
+      await this.sendReplyToNormalized(
+        normalized,
+        [
+          `plan: ${pendingPlan.status}`,
+          `file: ${pendingPlan.planFilePath}`,
+          "",
+          pendingPlan.summaryText || "暂无摘要。",
+        ].join("\n")
+      );
+      return;
+    }
+
+    this.sessionStore.setWorkspaceMode(bindingKey, workspaceRoot, "plan");
+    await this.sendReplyToNormalized(
+      normalized,
+      [
+        "已进入 Plan mode。",
+        "",
+        `workspace: ${workspaceRoot}`,
+        "接下来一条普通消息会以原生 Plan mode 提交，Codex 只做规划，不直接执行。",
+        "计划完成后会在微信里回一份摘要，并在项目内保存详细 Markdown。",
+        "确认无误后发送 `/codex execute` 开始执行。",
+      ].join("\n")
+    );
+  }
+
+  async handleExecuteCommand(normalized) {
+    const workspaceContext = await this.resolveWorkspaceContext(normalized);
+    if (!workspaceContext) {
+      return;
+    }
+
+    const { bindingKey, workspaceRoot } = workspaceContext;
+    const pendingPlan = this.sessionStore.getPendingPlanForWorkspace(bindingKey, workspaceRoot);
+    if (!pendingPlan || pendingPlan.status !== "ready") {
+      await this.sendReplyToNormalized(
+        normalized,
+        "当前没有可执行的计划。先进入 Plan mode 并等待计划生成完成。"
+      );
+      return;
+    }
+
+    let planText = "";
+    try {
+      planText = await fs.promises.readFile(pendingPlan.planFilePath, "utf8");
+    } catch (error) {
+      await this.sendReplyToNormalized(
+        normalized,
+        `计划文件读取失败: ${pendingPlan.planFilePath}\n${error.message || error}`
+      );
+      return;
+    }
+
+    const { threadId } = await this.resolveWorkspaceThreadState({
+      bindingKey,
+      workspaceRoot,
+      normalized,
+      autoSelectThread: true,
+    });
+    const effectiveThreadId = threadId || pendingPlan.threadId || "";
+    if (!effectiveThreadId) {
+      await this.sendReplyToNormalized(normalized, "当前找不到可继续执行的线程。请先发送一条普通消息重新建立线程。");
+      return;
+    }
+
+    this.pendingChatContextByThreadId.set(effectiveThreadId, normalized);
+    await this.ensureThreadResumed(effectiveThreadId);
+    await this.codex.sendUserMessage({
+      threadId: effectiveThreadId,
+      text: buildExecuteModePrompt({
+        workspaceRoot,
+        planFilePath: pendingPlan.planFilePath,
+        planText,
+      }),
+      model: null,
+      effort: null,
+      accessMode: this.config.defaultCodexAccessMode,
+      workspaceRoot,
+      collaborationMode: this.buildCollaborationModeForWorkspace(bindingKey, workspaceRoot, {
+        forceMode: "default",
+      }),
+    });
+    this.bindingKeyByThreadId.set(effectiveThreadId, bindingKey);
+    this.workspaceRootByThreadId.set(effectiveThreadId, workspaceRoot);
+    this.sessionStore.setWorkspaceMode(bindingKey, workspaceRoot, "default");
+    this.sessionStore.markPendingPlanConsumed(bindingKey, workspaceRoot);
+    await this.startTypingForThread(effectiveThreadId, normalized);
+    await this.sendReplyToNormalized(
+      normalized,
+      `已开始按计划执行。\n\nworkspace: ${workspaceRoot}\nplan_file: ${pendingPlan.planFilePath}`
+    );
+  }
+
+  async handleExitPlanCommand(normalized) {
+    const workspaceContext = await this.resolveWorkspaceContext(normalized);
+    if (!workspaceContext) {
+      return;
+    }
+    const { bindingKey, workspaceRoot } = workspaceContext;
+    this.sessionStore.setWorkspaceMode(bindingKey, workspaceRoot, "default");
+    await this.sendReplyToNormalized(
+      normalized,
+      `已退出 Plan mode。\n\nworkspace: ${workspaceRoot}`
+    );
+  }
+
+  async bindWorkspaceRoot(normalized, rawWorkspaceRoot, successTitle = "") {
+    const workspaceRoot = await this.validateWorkspaceRoot(rawWorkspaceRoot, normalized);
+    if (!workspaceRoot) {
       return;
     }
 
@@ -394,9 +637,10 @@ class WechatRuntime {
     this.sessionStore.setActiveWorkspaceRoot(bindingKey, workspaceRoot);
     await this.refreshWorkspaceThreads(bindingKey, workspaceRoot, normalized);
     const threadId = this.sessionStore.getThreadIdForWorkspace(bindingKey, workspaceRoot);
+    const header = successTitle || (threadId ? "已切换到项目，并恢复原线程。" : "已绑定项目。");
     const text = threadId
-      ? `已切换到项目，并恢复原线程。\n\nworkspace: ${workspaceRoot}\nthread: ${threadId}`
-      : `已绑定项目。\n\nworkspace: ${workspaceRoot}`;
+      ? `${header}\n\nworkspace: ${workspaceRoot}\nthread: ${threadId}`
+      : `${header}\n\nworkspace: ${workspaceRoot}`;
     await this.sendReplyToNormalized(normalized, text);
   }
 
@@ -422,13 +666,17 @@ class WechatRuntime {
     });
     const codexParams = this.getCodexParamsForWorkspace(bindingKey, workspaceRoot);
     const status = this.describeWorkspaceStatus(threadId);
+    const mode = this.sessionStore.getWorkspaceMode(bindingKey, workspaceRoot);
+    const pendingPlan = this.sessionStore.getPendingPlanForWorkspace(bindingKey, workspaceRoot);
     await this.sendReplyToNormalized(normalized, [
       `workspace: ${workspaceRoot}`,
       `thread: ${hasPendingNewThread ? "(new draft)" : (threadId || "(none)")}`,
       `status: ${status.label}`,
+      `mode: ${mode}`,
       `model: ${codexParams.model || "(default)"}`,
       `effort: ${codexParams.effort || "(default)"}`,
       `threads: ${threads.length}`,
+      `plan: ${pendingPlan ? pendingPlan.status : "(none)"}`,
     ].join("\n"));
   }
 
@@ -468,6 +716,7 @@ class WechatRuntime {
     const { bindingKey, workspaceRoot } = workspaceContext;
     this.sessionStore.setPendingNewThreadForWorkspace(bindingKey, workspaceRoot, true);
     this.sessionStore.clearThreadIdForWorkspace(bindingKey, workspaceRoot);
+    this.sessionStore.clearPendingPlanForWorkspace(bindingKey, workspaceRoot);
     await this.sendReplyToNormalized(
       normalized,
       `已切换到新会话，\n\nworkspace: ${workspaceRoot}\n。`
@@ -502,6 +751,7 @@ class WechatRuntime {
       targetThreadId,
       codexMessageUtils.buildBindingMetadata(normalized)
     );
+    this.sessionStore.clearPendingPlanForWorkspace(bindingKey, resolvedWorkspaceRoot);
     this.resumedThreadIds.delete(targetThreadId);
     await this.ensureThreadResumed(targetThreadId);
     await this.sendReplyToNormalized(
@@ -779,6 +1029,15 @@ class WechatRuntime {
       "/codex bind /绝对路径",
       "/codex where",
       "/codex workspace",
+      "/codex plan",
+      "/codex plan status",
+      "/codex plan show",
+      "/codex execute",
+      "/codex exit plan",
+      "/codex preset list",
+      "/codex preset add <别名> <绝对路径>",
+      "/codex preset remove <别名>",
+      "/codex use <序号|别名>",
       "/codex new",
       "/codex switch <threadId>",
       "/codex message",
@@ -818,6 +1077,29 @@ class WechatRuntime {
       return null;
     }
     return { bindingKey, workspaceRoot };
+  }
+
+  async validateWorkspaceRoot(rawWorkspaceRoot, normalized) {
+    const workspaceRoot = normalizeWorkspacePath(rawWorkspaceRoot);
+    if (!isAbsoluteWorkspacePath(workspaceRoot)) {
+      await this.sendReplyToNormalized(normalized, "只支持绝对路径绑定。");
+      return "";
+    }
+    if (!isWorkspaceAllowed(workspaceRoot, this.config.workspaceAllowlist)) {
+      await this.sendReplyToNormalized(normalized, "该项目不在允许绑定的白名单中。");
+      return "";
+    }
+
+    const workspaceStats = await this.resolveWorkspaceStats(workspaceRoot);
+    if (!workspaceStats.exists) {
+      await this.sendReplyToNormalized(normalized, `项目不存在: ${workspaceRoot}`);
+      return "";
+    }
+    if (!workspaceStats.isDirectory) {
+      await this.sendReplyToNormalized(normalized, `路径非法: ${workspaceRoot}`);
+      return "";
+    }
+    return workspaceRoot;
   }
 
   async prepareIncomingMessageForCodex(normalized, workspaceRoot) {
@@ -997,6 +1279,18 @@ class WechatRuntime {
 
   async ensureThreadAndSendMessage({ bindingKey, workspaceRoot, normalized, threadId }) {
     const codexParams = this.getCodexParamsForWorkspace(bindingKey, workspaceRoot);
+    const mode = this.sessionStore.getWorkspaceMode(bindingKey, workspaceRoot);
+    const requestedCollaborationMode = this.buildCollaborationModeForWorkspace(bindingKey, workspaceRoot, {
+      model: codexParams.model || null,
+      effort: codexParams.effort || null,
+    });
+    const outbound = this.buildOutboundPromptForWorkspace({
+      bindingKey,
+      workspaceRoot,
+      normalized,
+      mode,
+      collaborationMode: requestedCollaborationMode,
+    });
 
     if (!threadId) {
       const createdThreadId = await this.createWorkspaceThread({
@@ -1005,13 +1299,16 @@ class WechatRuntime {
         normalized,
       });
       this.pendingChatContextByThreadId.set(createdThreadId, normalized);
-      await this.codex.sendUserMessage({
+      await this.sendUserMessageWithPlanFallback({
         threadId: createdThreadId,
-        text: normalized.text,
+        bindingKey,
+        workspaceRoot,
+        normalized,
+        text: outbound.text,
         model: codexParams.model || null,
         effort: codexParams.effort || null,
         accessMode: this.config.defaultCodexAccessMode,
-        workspaceRoot,
+        collaborationMode: outbound.collaborationMode,
       });
       this.bindingKeyByThreadId.set(createdThreadId, bindingKey);
       this.workspaceRootByThreadId.set(createdThreadId, workspaceRoot);
@@ -1021,13 +1318,16 @@ class WechatRuntime {
     try {
       this.pendingChatContextByThreadId.set(threadId, normalized);
       await this.ensureThreadResumed(threadId);
-      await this.codex.sendUserMessage({
+      await this.sendUserMessageWithPlanFallback({
         threadId,
-        text: normalized.text,
+        bindingKey,
+        workspaceRoot,
+        normalized,
+        text: outbound.text,
         model: codexParams.model || null,
         effort: codexParams.effort || null,
         accessMode: this.config.defaultCodexAccessMode,
-        workspaceRoot,
+        collaborationMode: outbound.collaborationMode,
       });
       this.bindingKeyByThreadId.set(threadId, bindingKey);
       this.workspaceRootByThreadId.set(threadId, workspaceRoot);
@@ -1043,17 +1343,97 @@ class WechatRuntime {
         workspaceRoot,
         normalized,
       });
-      await this.codex.sendUserMessage({
+      await this.sendUserMessageWithPlanFallback({
         threadId: recreatedThreadId,
-        text: normalized.text,
+        bindingKey,
+        workspaceRoot,
+        normalized,
+        text: outbound.text,
         model: codexParams.model || null,
         effort: codexParams.effort || null,
         accessMode: this.config.defaultCodexAccessMode,
-        workspaceRoot,
+        collaborationMode: outbound.collaborationMode,
       });
       this.bindingKeyByThreadId.set(recreatedThreadId, bindingKey);
       this.workspaceRootByThreadId.set(recreatedThreadId, workspaceRoot);
       return recreatedThreadId;
+    }
+  }
+
+  buildOutboundPromptForWorkspace({ workspaceRoot, normalized, mode, collaborationMode }) {
+    if (mode !== "plan") {
+      return {
+        text: normalized.text,
+        collaborationMode,
+      };
+    }
+
+    return {
+      text: normalized.text,
+      collaborationMode,
+    };
+  }
+
+  buildCollaborationModeForWorkspace(bindingKey, workspaceRoot, options = {}) {
+    const forceMode = typeof options.forceMode === "string" ? options.forceMode.trim() : "";
+    const mode = forceMode || this.sessionStore.getWorkspaceMode(bindingKey, workspaceRoot);
+    const codexParams = this.getCodexParamsForWorkspace(bindingKey, workspaceRoot);
+    const model = options.model || codexParams.model || "";
+    if (!model || (mode !== "plan" && mode !== "default")) {
+      return null;
+    }
+
+    return {
+      mode,
+      settings: {
+        model,
+        reasoning_effort: options.effort || codexParams.effort || null,
+      },
+    };
+  }
+
+  async sendUserMessageWithPlanFallback({
+    threadId,
+    bindingKey,
+    workspaceRoot,
+    normalized,
+    text,
+    model,
+    effort,
+    accessMode,
+    collaborationMode,
+  }) {
+    try {
+      return await this.codex.sendUserMessage({
+        threadId,
+        text,
+        model,
+        effort,
+        accessMode,
+        workspaceRoot,
+        collaborationMode,
+      });
+    } catch (error) {
+      if (
+        !collaborationMode
+        || collaborationMode.mode !== "plan"
+        || !isUnsupportedCollaborationModeError(error)
+      ) {
+        throw error;
+      }
+
+      return this.codex.sendUserMessage({
+        threadId,
+        text: buildPlanModePrompt({
+          workspaceRoot,
+          userText: normalized.text,
+        }),
+        model,
+        effort,
+        accessMode,
+        workspaceRoot,
+        collaborationMode: null,
+      });
     }
   }
 
@@ -1101,6 +1481,77 @@ class WechatRuntime {
     return { code: "idle", label: "空闲" };
   }
 
+  async handleCompletedPlanRun({
+    bindingKey,
+    threadId,
+    workspaceRoot,
+    bufferedText,
+    planState,
+    planDeltaText,
+    context,
+  }) {
+    const planId = createPlanId(threadId);
+    const structuredPlanText = renderStructuredPlan(planState);
+    const extractedPlan = extractPlanBody(bufferedText);
+    const extractedDeltaPlan = extractPlanBody(planDeltaText);
+    const finalPlanText = structuredPlanText || extractedPlan || extractedDeltaPlan || bufferedText || planDeltaText;
+    const summaryText = buildPlanSummaryText(finalPlanText);
+    const planFilePath = await this.persistDetailedPlanFile({
+      workspaceRoot,
+      threadId,
+      planId,
+      planText: finalPlanText,
+      summaryText,
+    });
+
+    this.sessionStore.setPendingPlanForWorkspace(bindingKey, workspaceRoot, {
+      planId,
+      threadId,
+      workspaceRoot,
+      summaryText,
+      planFilePath,
+      createdAt: new Date().toISOString(),
+      status: "ready",
+    });
+    this.sessionStore.setWorkspaceMode(bindingKey, workspaceRoot, "default");
+
+    await this.sendReplyToUser(
+      context.senderId,
+      formatPlanCompletionReply({
+        workspaceRoot,
+        planFilePath,
+        summaryText: summaryText || "暂无摘要。",
+      }),
+      context.contextToken
+    );
+  }
+
+  async persistDetailedPlanFile({ workspaceRoot, threadId, planId, planText, summaryText }) {
+    const targetDir = path.join(workspaceRoot, PLAN_FILE_DIR);
+    await fs.promises.mkdir(targetDir, { recursive: true });
+    const fileName = `${planId}-${sanitizePlanThreadId(threadId)}.md`;
+    const planFilePath = path.join(targetDir, fileName);
+    const body = [
+      "# Codex Plan",
+      "",
+      `- planId: ${planId}`,
+      `- threadId: ${threadId || "(unknown)"}`,
+      `- workspace: ${workspaceRoot}`,
+      `- createdAt: ${new Date().toISOString()}`,
+      "",
+      "## Summary",
+      "",
+      summaryText || "(none)",
+      "",
+      "## Detailed Plan",
+      "",
+      planText || "(empty)",
+      "",
+    ].join("\n");
+    await fs.promises.writeFile(planFilePath, body, "utf8");
+    return planFilePath;
+  }
+
   async sendReplyToNormalized(normalized, text) {
     return this.sendReplyToUser(normalized.senderId, text, normalized.contextToken);
   }
@@ -1111,10 +1562,19 @@ class WechatRuntime {
       throw new Error(`缺少 context_token，无法回复用户 ${userId}`);
     }
 
-    const plainText = markdownToPlainText(text) || "已完成。";
-    const chunks = chunkReplyText(plainText);
-    for (const chunk of chunks.length ? chunks : ["已完成。"]) {
-      await sendMessage({
+    const chunks = Array.isArray(text)
+      ? text.filter((item) => typeof item === "string" && item.trim())
+      : chunkReplyText(markdownToPlainText(text) || "已完成。");
+    const effectiveChunks = chunks.length ? chunks : ["已完成。"];
+    console.log(
+      `[codex-wechat] prepared reply chunks to=${userId} count=${effectiveChunks.length} bytes=${effectiveChunks.map((chunk) => Buffer.byteLength(chunk, "utf8")).join(",")}`
+    );
+    for (let index = 0; index < effectiveChunks.length; index += 1) {
+      const chunk = effectiveChunks[index];
+      console.log(
+        `[codex-wechat] sending reply chunk ${index + 1}/${effectiveChunks.length} to=${userId} bytes=${Buffer.byteLength(chunk, "utf8")}`
+      );
+      const response = await sendMessage({
         baseUrl: this.account.baseUrl,
         token: this.account.token,
         body: {
@@ -1134,6 +1594,12 @@ class WechatRuntime {
           },
         },
       });
+      console.log(
+        `[codex-wechat] send reply chunk ok ${index + 1}/${effectiveChunks.length} to=${userId} ret=${response?.ret ?? 0} errcode=${response?.errcode ?? 0}`
+      );
+      if (index < effectiveChunks.length - 1) {
+        await sleep(CHUNK_SEND_DELAY_MS);
+      }
     }
   }
 
@@ -1243,6 +1709,7 @@ class WechatRuntime {
     codexMessageUtils.trackRunningTurn(this.activeTurnIdByThreadId, message);
     codexMessageUtils.trackPendingApproval(this.pendingApprovalByThreadId, message);
     codexMessageUtils.trackRunKeyState(this.currentRunKeyByThreadId, this.activeTurnIdByThreadId, message);
+    this.updatePlanStateBuffer(message);
 
     const outbound = codexMessageUtils.mapCodexMessageToImEvent(message);
     if (!outbound) {
@@ -1265,6 +1732,27 @@ class WechatRuntime {
     }
   }
 
+  updatePlanStateBuffer(message) {
+    const planUpdate = codexMessageUtils.extractPlanUpdate(message);
+    if (planUpdate) {
+      const runKey = codexMessageUtils.buildRunKey(planUpdate.threadId, planUpdate.turnId);
+      const current = this.planStateByRunKey.get(runKey) || {};
+      this.planStateByRunKey.set(runKey, {
+        explanation: planUpdate.explanation || current.explanation || "",
+        plan: planUpdate.plan,
+      });
+    }
+
+    const planDelta = codexMessageUtils.extractPlanDelta(message);
+    if (!planDelta) {
+      return;
+    }
+
+    const runKey = codexMessageUtils.buildRunKey(planDelta.threadId, planDelta.turnId);
+    const current = this.planDeltaBufferByRunKey.get(runKey) || "";
+    this.planDeltaBufferByRunKey.set(runKey, `${current}${planDelta.text}`);
+  }
+
   appendAssistantReplyBuffer(message, outbound) {
     const threadId = outbound.payload.threadId || "";
     const turnId = outbound.payload.turnId || this.activeTurnIdByThreadId.get(threadId) || "";
@@ -1280,6 +1768,14 @@ class WechatRuntime {
 
     if (message?.method === "item/agentMessage/delta") {
       this.replyBufferByRunKey.set(runKey, `${current}${text}`);
+      return;
+    }
+
+    if (message?.method === "item/completed") {
+      this.replyBufferByRunKey.set(runKey, text);
+      console.log(
+        `[codex-wechat] finalized reply buffer thread=${threadId} turn=${turnId} bytes=${Buffer.byteLength(text, "utf8")}`
+      );
       return;
     }
 
@@ -1411,8 +1907,11 @@ class WechatRuntime {
     const turnId = outbound.payload.turnId || this.activeTurnIdByThreadId.get(threadId) || "";
     const runKey = this.currentRunKeyByThreadId.get(threadId) || codexMessageUtils.buildRunKey(threadId, turnId);
     const bufferedText = this.replyBufferByRunKey.get(runKey) || "";
+    const planState = this.planStateByRunKey.get(runKey) || null;
+    const planDeltaText = this.planDeltaBufferByRunKey.get(runKey) || "";
     const context = this.pendingChatContextByThreadId.get(threadId);
     const workspaceRoot = this.workspaceRootByThreadId.get(threadId) || "";
+    const bindingKey = this.bindingKeyByThreadId.get(threadId) || "";
 
     if (outbound.payload.state === "streaming") {
       return;
@@ -1421,6 +1920,24 @@ class WechatRuntime {
     await this.stopTypingForThread(threadId);
 
     if (context && outbound.payload.state === "completed") {
+      if (bindingKey && workspaceRoot && this.sessionStore.getWorkspaceMode(bindingKey, workspaceRoot) === "plan") {
+        await this.handleCompletedPlanRun({
+          bindingKey,
+          threadId,
+          workspaceRoot,
+          bufferedText,
+          planState,
+          planDeltaText,
+          context,
+        });
+        this.replyBufferByRunKey.delete(runKey);
+        this.planStateByRunKey.delete(runKey);
+        this.planDeltaBufferByRunKey.delete(runKey);
+        this.activeTurnIdByThreadId.delete(threadId);
+        this.pendingApprovalByThreadId.delete(threadId);
+        return;
+      }
+
       const autoSent = await this.sendAssistantAttachmentsForReply({
         userId: context.senderId,
         contextToken: context.contextToken,
@@ -1428,21 +1945,52 @@ class WechatRuntime {
         replyText: bufferedText,
       });
       const hasPlainReplyText = !!markdownToPlainText(bufferedText);
-      if (hasPlainReplyText) {
-        await this.sendReplyToUser(context.senderId, bufferedText, context.contextToken);
-      } else if (!autoSent.sent.length) {
-        await this.sendReplyToUser(context.senderId, "å·²å®Œæˆã€‚", context.contextToken);
-      }
-
-      if (autoSent.failed.length) {
+      const promptDelivery = shouldUsePromptDelivery(bufferedText);
+      console.log(
+        `[codex-wechat] completed run thread=${threadId} turn=${turnId} buffered_bytes=${Buffer.byteLength(bufferedText || "", "utf8")} plain_bytes=${Buffer.byteLength(markdownToPlainText(bufferedText || ""), "utf8")} prompt_delivery=${promptDelivery} auto_sent=${autoSent.sent.length} auto_failed=${autoSent.failed.length}`
+      );
+      if (hasPlainReplyText || autoSent.sent.length || autoSent.failed.length) {
+        const formattedReply = promptDelivery
+          ? formatPromptDeliveryReply({
+            workspaceRoot,
+            replyText: bufferedText || "",
+            autoSent: autoSent.sent,
+            autoSendFailed: autoSent.failed,
+          })
+          : formatTaskCompletionReply({
+            workspaceRoot,
+            replyText: bufferedText || "",
+            autoSent: autoSent.sent,
+            autoSendFailed: autoSent.failed,
+          });
+        console.log(
+          `[codex-wechat] formatted completion reply thread=${threadId} turn=${turnId} chunks=${formattedReply.length} bytes=${formattedReply.map((chunk) => Buffer.byteLength(chunk, "utf8")).join(",")}`
+        );
         await this.sendReplyToUser(
           context.senderId,
-          buildAutoSendFailureText(autoSent.failed),
+          formattedReply,
+          context.contextToken
+        );
+      } else {
+        const formattedReply = formatTaskCompletionReply({
+          workspaceRoot,
+          replyText: "",
+          autoSent: autoSent.sent,
+          autoSendFailed: autoSent.failed,
+        });
+        console.log(
+          `[codex-wechat] formatted completion reply thread=${threadId} turn=${turnId} chunks=${formattedReply.length} bytes=${formattedReply.map((chunk) => Buffer.byteLength(chunk, "utf8")).join(",")}`
+        );
+        await this.sendReplyToUser(
+          context.senderId,
+          formattedReply,
           context.contextToken
         );
       }
 
       this.replyBufferByRunKey.delete(runKey);
+      this.planStateByRunKey.delete(runKey);
+      this.planDeltaBufferByRunKey.delete(runKey);
       this.activeTurnIdByThreadId.delete(threadId);
       this.pendingApprovalByThreadId.delete(threadId);
       return;
@@ -1450,19 +1998,125 @@ class WechatRuntime {
 
     if (context) {
       if (outbound.payload.state === "completed") {
-        await this.sendReplyToUser(context.senderId, bufferedText || "已完成。", context.contextToken);
+        await this.sendReplyToUser(
+          context.senderId,
+          formatTaskCompletionReply({
+            workspaceRoot,
+            replyText: bufferedText || "已完成。",
+            autoSent: [],
+            autoSendFailed: [],
+          }),
+          context.contextToken
+        );
       } else if (outbound.payload.state === "failed") {
-        const text = bufferedText
-          ? `${bufferedText}\n\n${outbound.payload.text || "执行失败"}`
-          : (outbound.payload.text || "执行失败");
-        await this.sendReplyToUser(context.senderId, text, context.contextToken);
+        await this.sendReplyToUser(
+          context.senderId,
+          formatTaskFailureReply({
+            workspaceRoot,
+            replyText: bufferedText,
+            failureText: outbound.payload.text || "执行失败",
+          }),
+          context.contextToken
+        );
       }
     }
 
     this.replyBufferByRunKey.delete(runKey);
+    this.planStateByRunKey.delete(runKey);
+    this.planDeltaBufferByRunKey.delete(runKey);
     this.activeTurnIdByThreadId.delete(threadId);
     this.pendingApprovalByThreadId.delete(threadId);
   }
+}
+
+function buildPlanModePrompt({ workspaceRoot, userText }) {
+  return [
+    "You are in a simulated Plan Mode for the current Codex thread.",
+    "Do not execute code changes or carry out mutating actions.",
+    "You may inspect, analyze, and ask targeted clarification questions if needed.",
+    "Produce the final plan only when it is decision-complete.",
+    "Return the final plan inside a <proposed_plan> block.",
+    "",
+    `Workspace: ${workspaceRoot}`,
+    "",
+    "User request:",
+    userText || "(empty)",
+  ].join("\n");
+}
+
+function buildExecuteModePrompt({ workspaceRoot, planFilePath, planText }) {
+  return [
+    "Execute the approved plan below in the current thread.",
+    "You are no longer in plan-only mode.",
+    "Use the saved plan as the authoritative execution input.",
+    "Carry the work through implementation and verification where feasible.",
+    "",
+    `Workspace: ${workspaceRoot}`,
+    `Plan file: ${planFilePath}`,
+    "",
+    "Approved plan:",
+    planText || "(empty)",
+  ].join("\n");
+}
+
+function extractPlanBody(text) {
+  const raw = String(text || "").trim();
+  if (!raw) {
+    return "";
+  }
+  const match = raw.match(/<proposed_plan>\s*([\s\S]*?)\s*<\/proposed_plan>/i);
+  if (match) {
+    return String(match[1] || "").trim();
+  }
+  return raw;
+}
+
+function renderStructuredPlan(planState) {
+  if (!planState || typeof planState !== "object") {
+    return "";
+  }
+
+  const steps = Array.isArray(planState.plan) ? planState.plan : [];
+  const explanation = typeof planState.explanation === "string" ? planState.explanation.trim() : "";
+  const lines = [];
+
+  if (explanation) {
+    lines.push(explanation, "");
+  }
+
+  if (steps.length) {
+    lines.push("## Plan", "");
+    for (const step of steps) {
+      const text = typeof step?.step === "string" ? step.step.trim() : "";
+      if (!text) {
+        continue;
+      }
+      lines.push(`- [${normalizePlanStepStatus(step?.status)}] ${text}`);
+    }
+  }
+
+  return lines.join("\n").trim();
+}
+
+function normalizePlanStepStatus(status) {
+  const normalized = String(status || "").trim();
+  if (normalized === "completed") {
+    return "completed";
+  }
+  if (normalized === "inProgress") {
+    return "in-progress";
+  }
+  return "pending";
+}
+
+function createPlanId(threadId) {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const suffix = sanitizePlanThreadId(threadId).slice(-12) || crypto.randomUUID().slice(0, 12);
+  return `${timestamp}-${suffix}`;
+}
+
+function sanitizePlanThreadId(threadId) {
+  return String(threadId || "thread").replace(/[^a-zA-Z0-9_-]/g, "_");
 }
 
 function shouldRecreateThread(error) {
@@ -1472,21 +2126,23 @@ function shouldRecreateThread(error) {
     || message.includes("no rollout found");
 }
 
+function isUnsupportedCollaborationModeError(error) {
+  const message = String(error?.message || "").toLowerCase();
+  return (
+    message.includes("collaborationmode")
+    || message.includes("collaboration mode")
+    || (message.includes("unknown field") && message.includes("turn/start"))
+    || message.includes("invalid params")
+    || message.includes("unknown parameter")
+  );
+}
+
 function isNoRolloutFoundError(error) {
   return String(error?.message || "").toLowerCase().includes("no rollout found");
 }
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function buildAutoSendFailureText(failed) {
-  const lines = ["è‡ªåŠ¨å‘é€é™„ä»¶å¤±è´¥:"];
-  for (const item of Array.isArray(failed) ? failed : []) {
-    const label = path.basename(item.filePath || "") || item.filePath || "(unknown file)";
-    lines.push(`- ${label}: ${item.reason || "upload failed"}`);
-  }
-  return lines.join("\n");
 }
 
 async function extractAutoSendFilePathsFromReply(replyText, workspaceRoot) {
