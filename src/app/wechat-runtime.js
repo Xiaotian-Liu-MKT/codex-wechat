@@ -2211,11 +2211,18 @@ class WechatRuntime {
       return;
     }
 
-    await this.sendReplyToUser(context.senderId, text, context.contextToken);
     this.progressNoticeByRunKey.set(runKey, {
       phase,
       sentAt: now,
     });
+
+    try {
+      await this.sendReplyToUser(context.senderId, text, context.contextToken);
+    } catch (error) {
+      console.error(
+        `[codex-wechat] progress notice failed thread=${threadId} phase=${phase} error=${error instanceof Error ? error.message : String(error)}`
+      );
+    }
   }
 }
 
