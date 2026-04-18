@@ -88,6 +88,18 @@ function mapCodexMessageToImEvent(message) {
     };
   }
 
+  if (method === "turn/cancelled") {
+    return {
+      type: "im.run_state",
+      payload: {
+        threadId,
+        turnId,
+        state: "failed",
+        text: "任务已取消",
+      },
+    };
+  }
+
   if (isApprovalRequestMethod(method)) {
     return {
       type: "im.approval_request",

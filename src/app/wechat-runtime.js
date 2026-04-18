@@ -14,6 +14,12 @@ const {
   loadPersistedContextTokens,
   persistContextToken,
 } = require("../infra/weixin/context-token-store");
+const {
+  clearActiveRun,
+  clearAllActiveRuns,
+  loadActiveRuns,
+  persistActiveRun,
+} = require("../infra/weixin/active-run-store");
 const { loadSyncBuffer, saveSyncBuffer } = require("../infra/weixin/sync-buffer-store");
 const {
   chunkReplyText,
@@ -101,6 +107,7 @@ class WechatRuntime {
     this.approvalAllowlistByWorkspaceRoot = new Map();
     this.resumedThreadIds = new Set();
     this.inFlightApprovalRequestKeys = new Set();
+    this.shutdownStarted = false;
     this.codex.onMessage((message) => {
       this.handleCodexMessage(message).catch((error) => {
         console.error(`[codex-wechat] failed to handle Codex message: ${error.message}`);
@@ -112,6 +119,7 @@ class WechatRuntime {
     this.account = resolveSelectedAccount(this.config);
     this.validateConfig();
     this.restorePersistedContextTokens();
+    await this.recoverInterruptedRuns();
     await this.codex.connect();
     await this.codex.initialize();
     await this.refreshAvailableModelCatalogAtStartup();
@@ -144,6 +152,41 @@ class WechatRuntime {
     if (restoredCount > 0) {
       console.log(`[codex-wechat] restored ${restoredCount} persisted context token(s)`);
     }
+  }
+
+  async recoverInterruptedRuns() {
+    if (!this.account?.accountId) {
+      return;
+    }
+
+    const activeRuns = loadActiveRuns(this.config, this.account.accountId);
+    const interruptedRuns = Object.values(activeRuns);
+    if (!interruptedRuns.length) {
+      return;
+    }
+
+    console.log(`[codex-wechat] recovering ${interruptedRuns.length} interrupted run(s)`);
+    const notifiedKeys = new Set();
+    for (const run of interruptedRuns) {
+      const notificationKey = `${run.senderId}:${run.contextToken}`;
+      if (notifiedKeys.has(notificationKey)) {
+        continue;
+      }
+      notifiedKeys.add(notificationKey);
+      try {
+        await this.sendReplyToUser(
+          run.senderId,
+          "本地 codex-wechat 服务在上一轮运行期间异常中断，上一条任务结果未送达。请直接重发上一条消息。",
+          run.contextToken
+        );
+      } catch (error) {
+        console.error(
+          `[codex-wechat] failed to recover interrupted run notice to=${run.senderId}: ${error.message}`
+        );
+      }
+    }
+
+    clearAllActiveRuns(this.config, this.account.accountId);
   }
 
   rememberContextToken(userId, contextToken) {
@@ -589,7 +632,7 @@ class WechatRuntime {
 
     this.pendingChatContextByThreadId.set(effectiveThreadId, normalized);
     await this.ensureThreadResumed(effectiveThreadId);
-    await this.codex.sendUserMessage({
+    const response = await this.codex.sendUserMessage({
       threadId: effectiveThreadId,
       text: buildExecuteModePrompt({
         workspaceRoot,
@@ -603,6 +646,13 @@ class WechatRuntime {
       collaborationMode: this.buildCollaborationModeForWorkspace(bindingKey, workspaceRoot, {
         forceMode: "default",
       }),
+    });
+    this.persistActiveRunRecord({
+      threadId: effectiveThreadId,
+      bindingKey,
+      workspaceRoot,
+      normalized,
+      response,
     });
     this.bindingKeyByThreadId.set(effectiveThreadId, bindingKey);
     this.workspaceRootByThreadId.set(effectiveThreadId, workspaceRoot);
@@ -1406,7 +1456,7 @@ class WechatRuntime {
     collaborationMode,
   }) {
     try {
-      return await this.codex.sendUserMessage({
+      const response = await this.codex.sendUserMessage({
         threadId,
         text,
         model,
@@ -1415,6 +1465,14 @@ class WechatRuntime {
         workspaceRoot,
         collaborationMode,
       });
+      this.persistActiveRunRecord({
+        threadId,
+        bindingKey,
+        workspaceRoot,
+        normalized,
+        response,
+      });
+      return response;
     } catch (error) {
       if (
         !collaborationMode
@@ -1424,7 +1482,7 @@ class WechatRuntime {
         throw error;
       }
 
-      return this.codex.sendUserMessage({
+      const response = await this.codex.sendUserMessage({
         threadId,
         text: buildPlanModePrompt({
           workspaceRoot,
@@ -1436,6 +1494,14 @@ class WechatRuntime {
         workspaceRoot,
         collaborationMode: null,
       });
+      this.persistActiveRunRecord({
+        threadId,
+        bindingKey,
+        workspaceRoot,
+        normalized,
+        response,
+      });
+      return response;
     }
   }
 
@@ -1651,6 +1717,38 @@ class WechatRuntime {
     return { sent, failed };
   }
 
+  persistActiveRunRecord({ threadId, bindingKey = "", workspaceRoot = "", normalized, response }) {
+    if (!this.account?.accountId) {
+      return;
+    }
+    const normalizedThreadId = String(threadId || "").trim();
+    const senderId = String(normalized?.senderId || "").trim();
+    const contextToken = String(normalized?.contextToken || this.contextTokenByUserId.get(senderId) || "").trim();
+    if (!normalizedThreadId || !senderId || !contextToken) {
+      return;
+    }
+
+    const turnId = String(response?.result?.turn?.id || "").trim();
+    const runKey = codexMessageUtils.buildRunKey(normalizedThreadId, turnId || "pending");
+    persistActiveRun(this.config, this.account.accountId, {
+      threadId: normalizedThreadId,
+      runKey,
+      senderId,
+      contextToken,
+      workspaceRoot,
+      bindingKey,
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  clearPersistedActiveRun(threadId) {
+    if (!this.account?.accountId) {
+      return;
+    }
+    clearActiveRun(this.config, this.account.accountId, threadId);
+  }
+
   async startTypingForThread(threadId, normalized) {
     if (!this.config.enableTyping || !threadId) {
       return;
@@ -1705,6 +1803,58 @@ class WechatRuntime {
     }
     this.typingStopByThreadId.delete(threadId);
     await stop();
+  }
+
+  async shutdown(reason = "service restart") {
+    if (this.shutdownStarted) {
+      return;
+    }
+    this.shutdownStarted = true;
+
+    console.log(`[codex-wechat] shutdown started: ${reason}`);
+
+    const threadIds = Array.from(this.typingStopByThreadId.keys());
+    for (const threadId of threadIds) {
+      try {
+        await this.stopTypingForThread(threadId);
+      } catch (error) {
+        console.error(`[codex-wechat] stop typing failed during shutdown thread=${threadId}: ${error.message}`);
+      }
+    }
+
+    const notifiedKeys = new Set();
+    for (const context of this.pendingChatContextByThreadId.values()) {
+      if (!context?.senderId) {
+        continue;
+      }
+      const notificationKey = `${context.senderId}:${context.contextToken || ""}`;
+      if (notifiedKeys.has(notificationKey)) {
+        continue;
+      }
+      notifiedKeys.add(notificationKey);
+
+      try {
+        await this.sendReplyToUser(
+          context.senderId,
+          "本地 codex-wechat 服务刚刚重启，当前这轮任务已中断。请直接重发上一条消息。",
+          context.contextToken
+        );
+      } catch (error) {
+        console.error(
+          `[codex-wechat] failed to send shutdown notice to=${context.senderId}: ${error.message}`
+        );
+      }
+    }
+
+    if (this.account?.accountId) {
+      clearAllActiveRuns(this.config, this.account.accountId);
+    }
+
+    try {
+      await this.codex.close();
+    } catch (error) {
+      console.error(`[codex-wechat] codex close failed during shutdown: ${error.message}`);
+    }
   }
 
   async handleCodexMessage(message) {
@@ -1939,6 +2089,9 @@ class WechatRuntime {
         this.progressNoticeByRunKey.delete(runKey);
         this.activeTurnIdByThreadId.delete(threadId);
         this.pendingApprovalByThreadId.delete(threadId);
+        if (this.account?.accountId) {
+          clearActiveRun(this.config, this.account.accountId, threadId);
+        }
         return;
       }
 
@@ -1998,6 +2151,9 @@ class WechatRuntime {
       this.progressNoticeByRunKey.delete(runKey);
       this.activeTurnIdByThreadId.delete(threadId);
       this.pendingApprovalByThreadId.delete(threadId);
+      if (this.account?.accountId) {
+        clearActiveRun(this.config, this.account.accountId, threadId);
+      }
       return;
     }
 
@@ -2032,6 +2188,9 @@ class WechatRuntime {
     this.progressNoticeByRunKey.delete(runKey);
     this.activeTurnIdByThreadId.delete(threadId);
     this.pendingApprovalByThreadId.delete(threadId);
+    if (this.account?.accountId) {
+      clearActiveRun(this.config, this.account.accountId, threadId);
+    }
   }
 
   async handleProgressNotice(outbound, runKey) {

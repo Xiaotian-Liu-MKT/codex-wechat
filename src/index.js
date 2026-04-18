@@ -82,11 +82,47 @@ async function main() {
 
   if (command === "start") {
     const runtime = new WechatRuntime(config);
+    installSignalHandlers(runtime);
     await runtime.start();
     return;
   }
 
   throw new Error(`未知命令: ${command}`);
+}
+
+function installSignalHandlers(runtime) {
+  let shuttingDown = false;
+
+  async function handleSignal(signal) {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    console.log(`[codex-wechat] received ${signal}, starting graceful shutdown`);
+
+    const forceExitTimer = setTimeout(() => {
+      console.error("[codex-wechat] graceful shutdown timed out, forcing exit");
+      process.exit(1);
+    }, 4_000);
+    forceExitTimer.unref?.();
+
+    try {
+      await runtime.shutdown(`${signal.toLowerCase()} received`);
+      clearTimeout(forceExitTimer);
+      process.exit(0);
+    } catch (error) {
+      clearTimeout(forceExitTimer);
+      console.error(`[codex-wechat] graceful shutdown failed: ${error.message}`);
+      process.exit(1);
+    }
+  }
+
+  process.on("SIGTERM", () => {
+    handleSignal("SIGTERM");
+  });
+  process.on("SIGINT", () => {
+    handleSignal("SIGINT");
+  });
 }
 
 module.exports = { main };

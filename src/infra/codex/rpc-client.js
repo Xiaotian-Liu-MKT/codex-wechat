@@ -252,6 +252,35 @@ class CodexRpcClient {
       listener(parsed);
     }
   }
+
+  async close() {
+    this.isReady = false;
+
+    for (const [id, pending] of this.pending.entries()) {
+      pending.reject(new Error("Codex RPC client closed"));
+      this.pending.delete(id);
+    }
+
+    if (this.mode === "websocket") {
+      if (this.socket) {
+        try {
+          this.socket.close();
+        } catch {}
+        this.socket = null;
+      }
+      return;
+    }
+
+    if (this.child) {
+      try {
+        this.child.stdin.end();
+      } catch {}
+      try {
+        this.child.kill("SIGTERM");
+      } catch {}
+      this.child = null;
+    }
+  }
 }
 
 function createRequestId() {

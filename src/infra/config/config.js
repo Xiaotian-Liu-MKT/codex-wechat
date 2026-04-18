@@ -30,6 +30,8 @@ function readConfig() {
       || path.join(stateDir, "sessions.json"),
     syncBufferDir: process.env.CODEX_WECHAT_SYNC_BUFFER_DIR
       || path.join(stateDir, "sync-buf"),
+    activeRunsDir: process.env.CODEX_WECHAT_ACTIVE_RUNS_DIR
+      || path.join(stateDir, "runtime"),
     accountsDir: path.join(stateDir, "accounts"),
     qrBotType: readTextEnv("CODEX_WECHAT_QR_BOT_TYPE") || "3",
   };
