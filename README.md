@@ -51,6 +51,10 @@ OpenClaw 不再作为运行时参与；这里只借用了 `@tencent-weixin/openc
 - 更适合微信阅读的结果回包
   - 区分计划摘要、任务完成、长提示词/大段代码等不同输出类型
   - 按 UTF-8 字节长度切分长消息，降低中文内容被截断的风险
+- 长任务阶段进度提示
+  - 基于 Codex stable 事件流向微信回传“已收到”“执行中”“修改文件中”“整理回复中”等阶段状态
+  - 同一阶段会做节流，避免长任务过程中刷屏
+  - 已按真实 `codex app-server` 事件样本校准 `userMessage`、`agentMessage`、`commandExecution`、`fileChange`、`reasoning`、`turn/diff/updated` 等类型
 - 更稳的微信发送错误处理
   - 主动检查 `sendMessage` 返回值并抛出 API 级错误，而不是静默失败
 - 运维增强
@@ -196,8 +200,9 @@ node ./bin/codex-wechat.js start
 2. `codex-wechat` 解析命令或普通对话
 3. 普通对话进入本地 Codex 线程
 4. 运行过程中发送 typing 指示
-5. Codex 完成后，结果回发到微信
-6. 如果 Codex 请求授权，微信里用 `/codex approve` 或 `/codex reject` 处理
+5. 长任务期间按阶段回传简短进度提示
+6. Codex 完成后，结果回发到微信
+7. 如果 Codex 请求授权，微信里用 `/codex approve` 或 `/codex reject` 处理
 
 ## 实现说明
 
@@ -217,11 +222,11 @@ node ./bin/codex-wechat.js start
 - `codex-wechat` 只应该同时运行一个实例。多个实例会同时抢微信长轮询，表现为微信侧发消息无响应或时灵时不灵。
 - 如果你是在受限沙箱里启动它，可能会看到 `monitor error: fetch failed`，因为进程拿不到微信网络访问能力。遇到这种情况，要在能访问外网的正常终端环境里重启。
 - 如果改了 `~/.codex-wechat/sessions.json` 这类运行状态文件，例如手动添加工作目录预设，运行中的进程不会自动热重载；需要重启 `codex-wechat` 才会生效。
+- 如果你 `git pull` 或切到包含新功能的提交，例如 Plan mode 兼容修正、阶段性进度提示等，已经在跑的 `codex-wechat` 进程也不会自动加载新代码；同样需要手动重启。
 - Plan mode 生成完成后，完整计划会保存到当前项目目录下的 `.codex-wechat/plans/`，微信里只回压缩摘要。
 
 ## 后续计划
 
-- 长任务过程中的阶段性进度提示，而不只是完成后一次性回包
 - 超长结果的摘要优先与文件落盘交付
 - `Plan mode` 的历史版本、执行回写和完整闭环
 - `feat/historyShare` 主线化
