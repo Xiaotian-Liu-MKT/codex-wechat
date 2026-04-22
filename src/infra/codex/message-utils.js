@@ -289,7 +289,11 @@ function trackPendingApproval(pendingApprovalByThreadId, message) {
       threadId,
       reason: params.reason || "",
       command: extractApprovalDisplayCommand(params, commandTokens),
+      justification: extractApprovalJustification(params),
+      sandboxPermissions: extractApprovalSandboxPermissions(params),
+      prefixRule: extractApprovalPrefixRule(params),
       commandTokens,
+      rawPayload: buildApprovalRawPayloadSnapshot(params),
       resolution: "",
     });
     return;
@@ -594,6 +598,83 @@ function extractApprovalDisplayCommand(params, commandTokens) {
     }
   }
   return buildApprovalCommandPreview(commandTokens);
+}
+
+function extractApprovalJustification(params) {
+  return firstNonEmptyString([
+    params?.justification,
+    params?.request?.justification,
+    params?.approval?.justification,
+    params?.reason,
+  ]);
+}
+
+function extractApprovalSandboxPermissions(params) {
+  return firstNonEmptyString([
+    params?.sandbox_permissions,
+    params?.sandboxPermissions,
+    params?.request?.sandbox_permissions,
+    params?.request?.sandboxPermissions,
+    params?.approval?.sandbox_permissions,
+    params?.approval?.sandboxPermissions,
+  ]);
+}
+
+function extractApprovalPrefixRule(params) {
+  return firstNonEmptyArray([
+    params?.prefix_rule,
+    params?.prefixRule,
+    params?.request?.prefix_rule,
+    params?.request?.prefixRule,
+    params?.approval?.prefix_rule,
+    params?.approval?.prefixRule,
+  ]);
+}
+
+function buildApprovalRawPayloadSnapshot(params) {
+  if (!params || typeof params !== "object") {
+    return null;
+  }
+
+  return {
+    reason: normalizeIdentifier(params.reason),
+    justification: extractApprovalJustification(params),
+    sandbox_permissions: extractApprovalSandboxPermissions(params),
+    prefix_rule: extractApprovalPrefixRule(params),
+    command: serializeApprovalRawCommand(params.command),
+  };
+}
+
+function serializeApprovalRawCommand(rawCommand) {
+  if (typeof rawCommand === "string") {
+    return rawCommand.trim();
+  }
+  if (Array.isArray(rawCommand)) {
+    return normalizeCommandTokens(rawCommand);
+  }
+  return rawCommand && typeof rawCommand === "object" ? rawCommand : null;
+}
+
+function firstNonEmptyString(candidates) {
+  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return "";
+}
+
+function firstNonEmptyArray(candidates) {
+  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+    if (!Array.isArray(candidate)) {
+      continue;
+    }
+    const normalized = normalizeCommandTokens(candidate);
+    if (normalized.length) {
+      return normalized;
+    }
+  }
+  return [];
 }
 
 function extractTokens(value) {

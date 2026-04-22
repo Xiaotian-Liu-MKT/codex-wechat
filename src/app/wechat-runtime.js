@@ -75,6 +75,11 @@ const LONG_TASK_NOTICE_DELAY_MS = 60_000;
 const PERIODIC_PROGRESS_NOTICE_INTERVAL_MS = 180_000;
 const COMPLETION_REPLY_MAX_RETRIES = 3;
 const PLAN_FILE_DIR = ".codex-wechat/plans";
+const APPROVAL_METHOD_MAX_CHARS = 80;
+const APPROVAL_PERMISSION_MAX_CHARS = 80;
+const APPROVAL_REASON_MAX_CHARS = 280;
+const APPROVAL_COMMAND_MAX_CHARS = 500;
+const APPROVAL_PREFIX_RULE_MAX_CHARS = 220;
 const THREAD_SOURCE_KINDS = new Set([
   "app",
   "cli",
@@ -2108,17 +2113,62 @@ class WechatRuntime {
     if (!context) {
       return;
     }
-    const commandText = approval.command || approval.reason || "(unknown)";
-    const text = [
-      "Codex 请求授权：",
-      commandText,
+    const text = this.formatApprovalRequestReply(approval);
+    await this.sendReplyToUser(context.senderId, text, context.contextToken);
+  }
+
+  formatApprovalRequestReply(approval) {
+    const commandText = truncateForWechat(
+      approval?.command || approval?.reason || "",
+      APPROVAL_COMMAND_MAX_CHARS
+    );
+    const reasonText = truncateForWechat(
+      approval?.justification || approval?.reason || "",
+      APPROVAL_REASON_MAX_CHARS
+    );
+    const sandboxPermissions = truncateForWechat(
+      approval?.sandboxPermissions || "",
+      APPROVAL_PERMISSION_MAX_CHARS
+    );
+    const prefixRule = truncateForWechat(
+      formatApprovalPrefixRule(approval?.prefixRule),
+      APPROVAL_PREFIX_RULE_MAX_CHARS
+    );
+    const methodText = truncateForWechat(
+      String(approval?.method || "").trim(),
+      APPROVAL_METHOD_MAX_CHARS
+    );
+
+    if (!commandText && !reasonText && !sandboxPermissions && !prefixRule && !methodText) {
+      return [
+        "Codex 请求授权：",
+        approval?.command || approval?.reason || "(unknown)",
+        "",
+        "回复以下命令继续：",
+        "/codex approve",
+        "/codex approve workspace",
+        "/codex reject",
+      ].join("\n");
+    }
+
+    const lines = [
+      "Codex 请求授权",
+      `类型: ${methodText || "未提供"}`,
+      `权限: ${sandboxPermissions || "未提供"}`,
+      `理由: ${reasonText || "未提供"}`,
+      `命令: ${commandText || "未提供"}`,
+    ];
+    if (prefixRule) {
+      lines.push(`前缀放行: ${prefixRule}`);
+    }
+    lines.push(
       "",
       "回复以下命令继续：",
       "/codex approve",
       "/codex approve workspace",
-      "/codex reject",
-    ].join("\n");
-    await this.sendReplyToUser(context.senderId, text, context.contextToken);
+      "/codex reject"
+    );
+    return lines.join("\n");
   }
 
   shouldAutoApproveRequest(workspaceRoot, approval) {
@@ -2696,6 +2746,29 @@ function stripAutoSendCandidateDecorations(candidate) {
 
 function normalizeTextValue(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function formatApprovalPrefixRule(prefixRule) {
+  const normalized = Array.isArray(prefixRule)
+    ? prefixRule
+      .map((token) => (typeof token === "string" ? token.trim() : ""))
+      .filter(Boolean)
+    : [];
+  if (!normalized.length) {
+    return "";
+  }
+  return normalized.map((token) => (token.includes(" ") ? JSON.stringify(token) : token)).join(" ");
+}
+
+function truncateForWechat(text, maxChars) {
+  const normalized = typeof text === "string" ? text.trim() : "";
+  if (!normalized) {
+    return "";
+  }
+  if (!Number.isFinite(maxChars) || maxChars <= 0 || normalized.length <= maxChars) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(1, maxChars - 15)).trimEnd()}... (truncated)`;
 }
 
 function buildCodexInboundText(originalText, persisted) {

@@ -93,7 +93,7 @@ npm install
 - `CODEX_WECHAT_ALLOWED_USER_IDS`
   - 只允许指定微信用户控制本机 Codex
 - `CODEX_WECHAT_DEFAULT_CODEX_ACCESS_MODE`
-  - `default`：工作区写入 + 需要审批
+  - `default`：按工作区沙箱运行；遇到需要提权的操作时，会在微信里显示结构化审批提示，并等待 `/codex approve` 或 `/codex reject`
   - `full-access`：全权限，不需要审批
 
 ## 登录微信
@@ -186,7 +186,7 @@ node ./bin/codex-wechat.js start
 - `/codex effort <low|medium|high|xhigh>`
   - 为当前项目设置推理强度
 - `/codex approve`
-  - 允许当前线程正在等待的这一次授权请求
+  - 允许当前线程正在等待的这一次授权请求；微信里的审批提示会显示类型、权限模式、理由、命令，以及可用时的前缀放行信息
 - `/codex approve workspace`
   - 允许当前授权请求，并把当前命令前缀加入该工作区的自动放行名单
 - `/codex reject`
@@ -214,7 +214,7 @@ node ./bin/codex-wechat.js start
 5. 长任务开始 60 秒后发送一次“任务仍在运行”提示，之后每 3 分钟做一次低频保活
 6. Codex 完成后，优先使用当前任务的聊天上下文回发结果；若该上下文已失效，会自动尝试回退到该用户最近一次消息对应的最新上下文
 7. 如果结果仍未送达，会将完整回复暂存为未送达结果；该用户下次再发消息时，服务会先自动补发上一条结果
-8. 如果 Codex 请求授权，微信里用 `/codex approve` 或 `/codex reject` 处理
+8. 如果 Codex 请求授权，微信会收到结构化审批提示，其中会尽量展示审批类型、权限模式、理由、命令，以及可用时的前缀放行信息；随后用 `/codex approve`、`/codex approve workspace` 或 `/codex reject` 处理
 
 ## 实现说明
 
