@@ -66,7 +66,8 @@ const BACKOFF_DELAY_MS = 30_000;
 const MAX_CONSECUTIVE_FAILURES = 3;
 const TYPING_KEEPALIVE_MS = 5_000;
 const CHUNK_SEND_DELAY_MS = 350;
-const PROGRESS_NOTICE_COOLDOWN_MS = 12_000;
+const PROGRESS_NOTICE_COOLDOWN_MS = 30_000;
+const COMPLETION_REPLY_MAX_RETRIES = 3;
 const PLAN_FILE_DIR = ".codex-wechat/plans";
 const THREAD_SOURCE_KINDS = new Set([
   "app",
@@ -101,6 +102,7 @@ class WechatRuntime {
     this.planStateByRunKey = new Map();
     this.planDeltaBufferByRunKey = new Map();
     this.progressNoticeByRunKey = new Map();
+    this.runStartTimeByRunKey = new Map();
     this.typingStopByThreadId = new Map();
     this.bindingKeyByThreadId = new Map();
     this.workspaceRootByThreadId = new Map();
@@ -1583,14 +1585,15 @@ class WechatRuntime {
     });
     this.sessionStore.setWorkspaceMode(bindingKey, workspaceRoot, "default");
 
-    await this.sendReplyToUser(
+    await this.sendReplyWithRetry(
       context.senderId,
       formatPlanCompletionReply({
         workspaceRoot,
         planFilePath,
         summaryText: summaryText || "暂无摘要。",
       }),
-      context.contextToken
+      context.contextToken,
+      `plan completion reply thread=${threadId}`
     );
   }
 
@@ -1622,6 +1625,27 @@ class WechatRuntime {
 
   async sendReplyToNormalized(normalized, text) {
     return this.sendReplyToUser(normalized.senderId, text, normalized.contextToken);
+  }
+
+  async sendReplyWithRetry(userId, text, contextToken, label) {
+    for (let attempt = 1; attempt <= COMPLETION_REPLY_MAX_RETRIES; attempt++) {
+      try {
+        await this.sendReplyToUser(userId, text, contextToken);
+        return;
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        if (attempt < COMPLETION_REPLY_MAX_RETRIES) {
+          console.error(
+            `[codex-wechat] ${label} attempt ${attempt}/${COMPLETION_REPLY_MAX_RETRIES} failed: ${msg} — retrying in ${RETRY_DELAY_MS}ms`
+          );
+          await sleep(RETRY_DELAY_MS);
+        } else {
+          console.error(
+            `[codex-wechat] ${label} all ${COMPLETION_REPLY_MAX_RETRIES} attempts failed: ${msg}`
+          );
+        }
+      }
+    }
   }
 
   async sendReplyToUser(userId, text, contextToken = "") {
@@ -2087,6 +2111,7 @@ class WechatRuntime {
         this.planStateByRunKey.delete(runKey);
         this.planDeltaBufferByRunKey.delete(runKey);
         this.progressNoticeByRunKey.delete(runKey);
+        this.runStartTimeByRunKey.delete(runKey);
         this.activeTurnIdByThreadId.delete(threadId);
         this.pendingApprovalByThreadId.delete(threadId);
         if (this.account?.accountId) {
@@ -2123,10 +2148,11 @@ class WechatRuntime {
         console.log(
           `[codex-wechat] formatted completion reply thread=${threadId} turn=${turnId} chunks=${formattedReply.length} bytes=${formattedReply.map((chunk) => Buffer.byteLength(chunk, "utf8")).join(",")}`
         );
-        await this.sendReplyToUser(
+        await this.sendReplyWithRetry(
           context.senderId,
           formattedReply,
-          context.contextToken
+          context.contextToken,
+          `completion reply thread=${threadId} turn=${turnId}`
         );
       } else {
         const formattedReply = formatTaskCompletionReply({
@@ -2138,10 +2164,11 @@ class WechatRuntime {
         console.log(
           `[codex-wechat] formatted completion reply thread=${threadId} turn=${turnId} chunks=${formattedReply.length} bytes=${formattedReply.map((chunk) => Buffer.byteLength(chunk, "utf8")).join(",")}`
         );
-        await this.sendReplyToUser(
+        await this.sendReplyWithRetry(
           context.senderId,
           formattedReply,
-          context.contextToken
+          context.contextToken,
+          `completion reply thread=${threadId} turn=${turnId}`
         );
       }
 
@@ -2149,6 +2176,7 @@ class WechatRuntime {
       this.planStateByRunKey.delete(runKey);
       this.planDeltaBufferByRunKey.delete(runKey);
       this.progressNoticeByRunKey.delete(runKey);
+      this.runStartTimeByRunKey.delete(runKey);
       this.activeTurnIdByThreadId.delete(threadId);
       this.pendingApprovalByThreadId.delete(threadId);
       if (this.account?.accountId) {
@@ -2159,7 +2187,7 @@ class WechatRuntime {
 
     if (context) {
       if (outbound.payload.state === "completed") {
-        await this.sendReplyToUser(
+        await this.sendReplyWithRetry(
           context.senderId,
           formatTaskCompletionReply({
             workspaceRoot,
@@ -2167,17 +2195,19 @@ class WechatRuntime {
             autoSent: [],
             autoSendFailed: [],
           }),
-          context.contextToken
+          context.contextToken,
+          `completion reply thread=${threadId} turn=${turnId}`
         );
       } else if (outbound.payload.state === "failed") {
-        await this.sendReplyToUser(
+        await this.sendReplyWithRetry(
           context.senderId,
           formatTaskFailureReply({
             workspaceRoot,
             replyText: bufferedText,
             failureText: outbound.payload.text || "执行失败",
           }),
-          context.contextToken
+          context.contextToken,
+          `failure reply thread=${threadId} turn=${turnId}`
         );
       }
     }
@@ -2186,6 +2216,7 @@ class WechatRuntime {
     this.planStateByRunKey.delete(runKey);
     this.planDeltaBufferByRunKey.delete(runKey);
     this.progressNoticeByRunKey.delete(runKey);
+    this.runStartTimeByRunKey.delete(runKey);
     this.activeTurnIdByThreadId.delete(threadId);
     this.pendingApprovalByThreadId.delete(threadId);
     if (this.account?.accountId) {
@@ -2211,13 +2242,22 @@ class WechatRuntime {
       return;
     }
 
+    if (phase === "started") {
+      this.runStartTimeByRunKey.set(runKey, now);
+    }
+
     this.progressNoticeByRunKey.set(runKey, {
       phase,
       sentAt: now,
     });
 
+    const startTime = this.runStartTimeByRunKey.get(runKey);
+    const displayText = (startTime && phase !== "started")
+      ? `${text}（已运行 ${formatElapsed(now - startTime)}）`
+      : text;
+
     try {
-      await this.sendReplyToUser(context.senderId, text, context.contextToken);
+      await this.sendReplyToUser(context.senderId, displayText, context.contextToken);
     } catch (error) {
       console.error(
         `[codex-wechat] progress notice failed thread=${threadId} phase=${phase} error=${error instanceof Error ? error.message : String(error)}`
@@ -2340,6 +2380,13 @@ function isNoRolloutFoundError(error) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatElapsed(ms) {
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
 }
 
 async function extractAutoSendFilePathsFromReply(replyText, workspaceRoot) {
