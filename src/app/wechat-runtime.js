@@ -20,6 +20,11 @@ const {
   loadActiveRuns,
   persistActiveRun,
 } = require("../infra/weixin/active-run-store");
+const {
+  clearUndeliveredReply,
+  loadUndeliveredReplies,
+  persistUndeliveredReply,
+} = require("../infra/weixin/undelivered-store");
 const { loadSyncBuffer, saveSyncBuffer } = require("../infra/weixin/sync-buffer-store");
 const {
   chunkReplyText,
@@ -66,7 +71,8 @@ const BACKOFF_DELAY_MS = 30_000;
 const MAX_CONSECUTIVE_FAILURES = 3;
 const TYPING_KEEPALIVE_MS = 5_000;
 const CHUNK_SEND_DELAY_MS = 350;
-const PROGRESS_NOTICE_COOLDOWN_MS = 30_000;
+const LONG_TASK_NOTICE_DELAY_MS = 60_000;
+const PERIODIC_PROGRESS_NOTICE_INTERVAL_MS = 180_000;
 const COMPLETION_REPLY_MAX_RETRIES = 3;
 const PLAN_FILE_DIR = ".codex-wechat/plans";
 const THREAD_SOURCE_KINDS = new Set([
@@ -110,6 +116,7 @@ class WechatRuntime {
     this.resumedThreadIds = new Set();
     this.inFlightApprovalRequestKeys = new Set();
     this.shutdownStarted = false;
+    this.deliveryRetryableContextErrorPattern = /ret=-2\b/i;
     this.codex.onMessage((message) => {
       this.handleCodexMessage(message).catch((error) => {
         console.error(`[codex-wechat] failed to handle Codex message: ${error.message}`);
@@ -200,6 +207,14 @@ class WechatRuntime {
 
     this.contextTokenByUserId.set(normalizedUserId, normalizedToken);
     persistContextToken(this.config, this.account.accountId, normalizedUserId, normalizedToken);
+  }
+
+  getLatestContextTokenForUser(userId) {
+    const normalizedUserId = String(userId || "").trim();
+    if (!normalizedUserId) {
+      return "";
+    }
+    return String(this.contextTokenByUserId.get(normalizedUserId) || "").trim();
   }
 
   async refreshAvailableModelCatalogAtStartup() {
@@ -322,6 +337,8 @@ class WechatRuntime {
     }
 
     try {
+      await this.flushUndeliveredRepliesForUser(normalized.senderId, normalized.contextToken);
+
       if (await this.dispatchTextCommand(normalized)) {
         return;
       }
@@ -1627,11 +1644,13 @@ class WechatRuntime {
     return this.sendReplyToUser(normalized.senderId, text, normalized.contextToken);
   }
 
-  async sendReplyWithRetry(userId, text, contextToken, label) {
+  async sendReplyWithRetry(userId, text, contextToken, label, options = {}) {
     for (let attempt = 1; attempt <= COMPLETION_REPLY_MAX_RETRIES; attempt++) {
       try {
-        await this.sendReplyToUser(userId, text, contextToken);
-        return;
+        await this.sendReplyToUser(userId, text, contextToken, {
+          allowLatestTokenFallback: true,
+        });
+        return { delivered: true, attempts: attempt };
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         if (attempt < COMPLETION_REPLY_MAX_RETRIES) {
@@ -1643,28 +1662,42 @@ class WechatRuntime {
           console.error(
             `[codex-wechat] ${label} all ${COMPLETION_REPLY_MAX_RETRIES} attempts failed: ${msg}`
           );
+          if (options.onFinalFailure) {
+            await options.onFinalFailure({
+              attempts: attempt,
+              error,
+            });
+          }
         }
       }
     }
+    return { delivered: false, attempts: COMPLETION_REPLY_MAX_RETRIES };
   }
 
-  async sendReplyToUser(userId, text, contextToken = "") {
-    const resolvedToken = contextToken || this.contextTokenByUserId.get(userId) || "";
+  buildReplyChunks(text) {
+    const chunks = Array.isArray(text)
+      ? text.filter((item) => typeof item === "string" && item.trim())
+      : chunkReplyText(markdownToPlainText(text) || "已完成。");
+    return chunks.length ? chunks : ["已完成。"];
+  }
+
+  isRetryableContextTokenError(error) {
+    return this.deliveryRetryableContextErrorPattern.test(String(error?.message || ""));
+  }
+
+  async sendReplyChunksToUser(userId, chunks, contextToken) {
+    const resolvedToken = String(contextToken || "").trim();
     if (!resolvedToken) {
       throw new Error(`缺少 context_token，无法回复用户 ${userId}`);
     }
 
-    const chunks = Array.isArray(text)
-      ? text.filter((item) => typeof item === "string" && item.trim())
-      : chunkReplyText(markdownToPlainText(text) || "已完成。");
-    const effectiveChunks = chunks.length ? chunks : ["已完成。"];
     console.log(
-      `[codex-wechat] prepared reply chunks to=${userId} count=${effectiveChunks.length} bytes=${effectiveChunks.map((chunk) => Buffer.byteLength(chunk, "utf8")).join(",")}`
+      `[codex-wechat] prepared reply chunks to=${userId} count=${chunks.length} bytes=${chunks.map((chunk) => Buffer.byteLength(chunk, "utf8")).join(",")} token_source=context`
     );
-    for (let index = 0; index < effectiveChunks.length; index += 1) {
-      const chunk = effectiveChunks[index];
+    for (let index = 0; index < chunks.length; index += 1) {
+      const chunk = chunks[index];
       console.log(
-        `[codex-wechat] sending reply chunk ${index + 1}/${effectiveChunks.length} to=${userId} bytes=${Buffer.byteLength(chunk, "utf8")}`
+        `[codex-wechat] sending reply chunk ${index + 1}/${chunks.length} to=${userId} bytes=${Buffer.byteLength(chunk, "utf8")}`
       );
       const response = await sendMessage({
         baseUrl: this.account.baseUrl,
@@ -1682,16 +1715,103 @@ class WechatRuntime {
                 text_item: { text: chunk },
               },
             ],
-            context_token: resolvedToken,
+            context_token: String(resolvedToken),
           },
         },
       });
       console.log(
-        `[codex-wechat] send reply chunk ok ${index + 1}/${effectiveChunks.length} to=${userId} ret=${response?.ret ?? 0} errcode=${response?.errcode ?? 0}`
+        `[codex-wechat] send reply chunk ok ${index + 1}/${chunks.length} to=${userId} ret=${response?.ret ?? 0} errcode=${response?.errcode ?? 0}`
       );
-      if (index < effectiveChunks.length - 1) {
+      if (index < chunks.length - 1) {
         await sleep(CHUNK_SEND_DELAY_MS);
       }
+    }
+  }
+
+  async sendReplyToUser(userId, text, contextToken = "", options = {}) {
+    const effectiveChunks = this.buildReplyChunks(text);
+    const preferredToken = String(contextToken || "").trim();
+    if (preferredToken) {
+      try {
+        await this.sendReplyChunksToUser(userId, effectiveChunks, preferredToken);
+        return;
+      } catch (error) {
+        if (!options.allowLatestTokenFallback || !this.isRetryableContextTokenError(error)) {
+          throw error;
+        }
+        console.error(
+          `[codex-wechat] send reply using stored context token failed for ${userId}: ${error.message} — retrying with latest context token`
+        );
+      }
+    }
+
+    const latestToken = this.getLatestContextTokenForUser(userId);
+    if (!latestToken) {
+      if (preferredToken) {
+        throw new Error(`回复失败且当前没有可用的新 context_token: ${userId}`);
+      }
+      throw new Error(`缺少 context_token，无法回复用户 ${userId}`);
+    }
+    if (preferredToken && latestToken === preferredToken) {
+      throw new Error(`sendMessage failed ret=-2 errcode=undefined errmsg= (context token invalid and no newer token available)`);
+    }
+
+    console.log(`[codex-wechat] retrying reply with latest context token for ${userId}`);
+    await this.sendReplyChunksToUser(userId, effectiveChunks, latestToken);
+  }
+
+  async persistUndeliveredReply({ senderId, threadId, turnId, runKey, workspaceRoot, label, replyChunks, attempts, error }) {
+    if (!this.account?.accountId) {
+      return;
+    }
+    const reason = error instanceof Error ? error.message : String(error || "");
+    persistUndeliveredReply(this.config, this.account.accountId, {
+      senderId,
+      threadId,
+      turnId,
+      runKey,
+      workspaceRoot,
+      label,
+      replyChunks,
+      attempts,
+      reason,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    console.error(
+      `[codex-wechat] persisted undelivered reply sender=${senderId} thread=${threadId} turn=${turnId} label=${label} attempts=${attempts} reason=${reason}`
+    );
+  }
+
+  async flushUndeliveredRepliesForUser(userId, contextToken = "") {
+    if (!this.account?.accountId) {
+      return;
+    }
+    const normalizedUserId = String(userId || "").trim();
+    const latestToken = String(contextToken || this.getLatestContextTokenForUser(normalizedUserId) || "").trim();
+    if (!normalizedUserId || !latestToken) {
+      return;
+    }
+
+    const undelivered = loadUndeliveredReplies(this.config, this.account.accountId)[normalizedUserId];
+    if (!undelivered) {
+      return;
+    }
+
+    const recoveryChunks = [
+      `检测到上一条结果未送达，现补发如下。`,
+      ...undelivered.replyChunks,
+    ];
+    try {
+      await this.sendReplyChunksToUser(normalizedUserId, recoveryChunks, latestToken);
+      clearUndeliveredReply(this.config, this.account.accountId, normalizedUserId);
+      console.log(
+        `[codex-wechat] flushed undelivered reply sender=${normalizedUserId} thread=${undelivered.threadId} turn=${undelivered.turnId}`
+      );
+    } catch (error) {
+      console.error(
+        `[codex-wechat] failed to flush undelivered reply sender=${normalizedUserId}: ${error instanceof Error ? error.message : String(error)}`
+      );
     }
   }
 
@@ -2107,16 +2227,7 @@ class WechatRuntime {
           planDeltaText,
           context,
         });
-        this.replyBufferByRunKey.delete(runKey);
-        this.planStateByRunKey.delete(runKey);
-        this.planDeltaBufferByRunKey.delete(runKey);
-        this.progressNoticeByRunKey.delete(runKey);
-        this.runStartTimeByRunKey.delete(runKey);
-        this.activeTurnIdByThreadId.delete(threadId);
-        this.pendingApprovalByThreadId.delete(threadId);
-        if (this.account?.accountId) {
-          clearActiveRun(this.config, this.account.accountId, threadId);
-        }
+        this.cleanupRunState(threadId, runKey);
         return;
       }
 
@@ -2152,7 +2263,22 @@ class WechatRuntime {
           context.senderId,
           formattedReply,
           context.contextToken,
-          `completion reply thread=${threadId} turn=${turnId}`
+          `completion reply thread=${threadId} turn=${turnId}`,
+          {
+            onFinalFailure: async ({ attempts, error }) => {
+              await this.persistUndeliveredReply({
+                senderId: context.senderId,
+                threadId,
+                turnId,
+                runKey,
+                workspaceRoot,
+                label: "completion",
+                replyChunks: formattedReply,
+                attempts,
+                error,
+              });
+            },
+          }
         );
       } else {
         const formattedReply = formatTaskCompletionReply({
@@ -2168,50 +2294,92 @@ class WechatRuntime {
           context.senderId,
           formattedReply,
           context.contextToken,
-          `completion reply thread=${threadId} turn=${turnId}`
+          `completion reply thread=${threadId} turn=${turnId}`,
+          {
+            onFinalFailure: async ({ attempts, error }) => {
+              await this.persistUndeliveredReply({
+                senderId: context.senderId,
+                threadId,
+                turnId,
+                runKey,
+                workspaceRoot,
+                label: "completion",
+                replyChunks: formattedReply,
+                attempts,
+                error,
+              });
+            },
+          }
         );
       }
 
-      this.replyBufferByRunKey.delete(runKey);
-      this.planStateByRunKey.delete(runKey);
-      this.planDeltaBufferByRunKey.delete(runKey);
-      this.progressNoticeByRunKey.delete(runKey);
-      this.runStartTimeByRunKey.delete(runKey);
-      this.activeTurnIdByThreadId.delete(threadId);
-      this.pendingApprovalByThreadId.delete(threadId);
-      if (this.account?.accountId) {
-        clearActiveRun(this.config, this.account.accountId, threadId);
-      }
+      this.cleanupRunState(threadId, runKey);
       return;
     }
 
     if (context) {
       if (outbound.payload.state === "completed") {
+        const replyChunks = formatTaskCompletionReply({
+          workspaceRoot,
+          replyText: bufferedText || "已完成。",
+          autoSent: [],
+          autoSendFailed: [],
+        });
         await this.sendReplyWithRetry(
           context.senderId,
-          formatTaskCompletionReply({
-            workspaceRoot,
-            replyText: bufferedText || "已完成。",
-            autoSent: [],
-            autoSendFailed: [],
-          }),
+          replyChunks,
           context.contextToken,
-          `completion reply thread=${threadId} turn=${turnId}`
+          `completion reply thread=${threadId} turn=${turnId}`,
+          {
+            onFinalFailure: async ({ attempts, error }) => {
+              await this.persistUndeliveredReply({
+                senderId: context.senderId,
+                threadId,
+                turnId,
+                runKey,
+                workspaceRoot,
+                label: "completion",
+                replyChunks,
+                attempts,
+                error,
+              });
+            },
+          }
         );
       } else if (outbound.payload.state === "failed") {
+        const replyChunks = formatTaskFailureReply({
+          workspaceRoot,
+          replyText: bufferedText,
+          failureText: outbound.payload.text || "执行失败",
+        });
         await this.sendReplyWithRetry(
           context.senderId,
-          formatTaskFailureReply({
-            workspaceRoot,
-            replyText: bufferedText,
-            failureText: outbound.payload.text || "执行失败",
-          }),
+          replyChunks,
           context.contextToken,
-          `failure reply thread=${threadId} turn=${turnId}`
+          `failure reply thread=${threadId} turn=${turnId}`,
+          {
+            onFinalFailure: async ({ attempts, error }) => {
+              await this.persistUndeliveredReply({
+                senderId: context.senderId,
+                threadId,
+                turnId,
+                runKey,
+                workspaceRoot,
+                label: "failure",
+                replyChunks,
+                attempts,
+                error,
+              });
+            },
+          }
         );
       }
     }
 
+    this.cleanupRunState(threadId, runKey);
+  }
+
+  cleanupRunState(threadId, runKey) {
     this.replyBufferByRunKey.delete(runKey);
     this.planStateByRunKey.delete(runKey);
     this.planDeltaBufferByRunKey.delete(runKey);
@@ -2234,35 +2402,66 @@ class WechatRuntime {
     }
 
     const now = Date.now();
-    const previous = this.progressNoticeByRunKey.get(runKey) || null;
-    const shouldSend = !previous
-      || previous.phase !== phase
-      || (now - previous.sentAt) >= PROGRESS_NOTICE_COOLDOWN_MS;
-    if (!shouldSend) {
-      return;
-    }
-
-    if (phase === "started") {
+    if (phase === "started" || !this.runStartTimeByRunKey.has(runKey)) {
       this.runStartTimeByRunKey.set(runKey, now);
     }
 
-    this.progressNoticeByRunKey.set(runKey, {
-      phase,
-      sentAt: now,
-    });
-
     const startTime = this.runStartTimeByRunKey.get(runKey);
-    const displayText = (startTime && phase !== "started")
-      ? `${text}（已运行 ${formatElapsed(now - startTime)}）`
-      : text;
-
-    try {
-      await this.sendReplyToUser(context.senderId, displayText, context.contextToken);
-    } catch (error) {
-      console.error(
-        `[codex-wechat] progress notice failed thread=${threadId} phase=${phase} error=${error instanceof Error ? error.message : String(error)}`
-      );
+    if (!startTime) {
+      return;
     }
+
+    const progressState = this.progressNoticeByRunKey.get(runKey) || {
+      longTaskNoticeSent: false,
+      lastPhase: "",
+      lastUpdatedAt: 0,
+      lastNotifiedAt: 0,
+    };
+    progressState.lastPhase = phase;
+    progressState.lastUpdatedAt = now;
+
+    if (!progressState.longTaskNoticeSent && (now - startTime) >= LONG_TASK_NOTICE_DELAY_MS) {
+      progressState.longTaskNoticeSent = true;
+      progressState.lastNotifiedAt = now;
+      this.progressNoticeByRunKey.set(runKey, progressState);
+
+      try {
+        await this.sendReplyToUser(
+          context.senderId,
+          `任务仍在运行（已运行 ${formatElapsed(now - startTime)}）`,
+          context.contextToken,
+          { allowLatestTokenFallback: true }
+        );
+      } catch (error) {
+        console.error(
+          `[codex-wechat] progress notice failed thread=${threadId} phase=${phase} error=${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+      return;
+    }
+
+    if (
+      progressState.longTaskNoticeSent
+      && (now - progressState.lastNotifiedAt) >= PERIODIC_PROGRESS_NOTICE_INTERVAL_MS
+    ) {
+      progressState.lastNotifiedAt = now;
+      this.progressNoticeByRunKey.set(runKey, progressState);
+      try {
+        await this.sendReplyToUser(
+          context.senderId,
+          `任务仍在运行（阶段: ${phase}，已运行 ${formatElapsed(now - startTime)}）`,
+          context.contextToken,
+          { allowLatestTokenFallback: true }
+        );
+      } catch (error) {
+        console.error(
+          `[codex-wechat] periodic progress notice failed thread=${threadId} phase=${phase} error=${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+      return;
+    }
+
+    this.progressNoticeByRunKey.set(runKey, progressState);
   }
 }
 
